@@ -5,6 +5,6 @@ OKN](http://www.scales-okn.org).
 
 # Contents
 
-## Evaluating *In Forma Pauperis* in 2016
+## 2020 Improve data access to make justice systems more just
 
-**Folder:** `ifp_2016`
+**Folder:** `2020_improve_data_access_to_make_justice_systems_more_just`
