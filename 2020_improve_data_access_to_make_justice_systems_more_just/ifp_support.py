@@ -1,10 +1,12 @@
 import re
 import pandas as pd
+from hashlib import blake2b
+import json
 
 committee_names = {'Respondent':10000001, 'Unassigned':10000002, \
-				   'Movant':10000003, 'Fugitive Calendar':10000004, \
-				   'Executive Committee':10000005, 'Status':10000006, \
-				   '':10000000}
+                   'Movant':10000003, 'Fugitive Calendar':10000004, \
+                   'Executive Committee':10000005, 'Status':10000006, \
+                   '':10000000}
 
 def clean_names(jname):
     #If the 'judge_name' is in the committee names then get rid of it and return none
@@ -44,6 +46,16 @@ def name_identifier(row, unique_set):
             print('multiple matches', jname, match_indices)
             return None
 
+def name_hasher(name):
+    '''
+    Hashes the judge name
+    '''
+    env = json.load(open('/Users/adampah/.scales_env.json'))
+    h = blake2b(digest_size=env['AUTH_SIZE'], key=env['SECRET_KEY'].encode('UTF-8'))
+    h.update(name.encode('UTF-8'))
+    return h.hexdigest().encode('utf-8')
+
+
 ######################
 #Decision Functions
 ######################
@@ -71,8 +83,10 @@ def process_dataframe(df):
     unique_set = list(set( df.clean_name.unique() ))
     df['unique_name'] = df.apply(lambda x: name_identifier(x, unique_set), axis=1)
     df.dropna(subset=['unique_name'], inplace=True)
+    #Hash the name
+    df['hash_name'] = df.unique_name.apply(lambda x: name_hasher(x))
     #Total decisions
-    jcountdf = df.loc[:, ['unique_name', 'resolution']].groupby('unique_name').agg(total_decisions).reset_index()
-    jcountdf.columns = ['unique_name', 'total_decisions']
-    df = df.merge(jcountdf, on='unique_name', how='left')
+    jcountdf = df.loc[:, ['hash_name', 'resolution']].groupby('hash_name').agg(total_decisions).reset_index()
+    jcountdf.columns = ['hash_name', 'total_decisions']
+    df = df.merge(jcountdf, on='hash_name', how='left')
     return df
