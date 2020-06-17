@@ -1,3 +1,0 @@
-/Users/adampah/Dropbox (Personal)/Projects/pacer-scraper/data/pacer/vid/json/3-16-cv-00053-CVG-RM.json
-/Users/adampah/Dropbox (Personal)/Projects/pacer-scraper/data/pacer/vid/json/3-16-cv-00023-CVG-RM.json
-/Users/adampah/Dropbox (Personal)/Projects/pacer-scraper/data/pacer/vid/json/3-16-cr-00008-CVG-RM.json
