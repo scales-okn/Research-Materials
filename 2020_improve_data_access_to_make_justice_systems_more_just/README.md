@@ -1,4 +1,4 @@
-# code instructions
+# Code instructions
 
 package dependencies and language models are contained within `pip_installs.sh`. on the command line
 this script can be executed with bash.
@@ -13,9 +13,9 @@ running the transformation from the csv file to the figure is accomplished with:
 
 `$ do figure1_script.do`
 
-# overview
+# Overview
 
-## raw data collection and availability
+## Raw data collection and availability
 
 we queried the pacer cm/ecf system for all cases filed between jan. 1st to december 31st in 2016. we
 then downloaded the dockets for all cases with a “cv” or “cr” designation that were the main case
