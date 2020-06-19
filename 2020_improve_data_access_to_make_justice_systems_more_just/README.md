@@ -1,33 +1,43 @@
-# Code Instructions
+# code instructions
 
-Package dependencies and language models are contained within `pip_installs.sh`. On the command line
+package dependencies and language models are contained within `pip_installs.sh`. on the command line
 this script can be executed with bash.
 
 `$ bash pip_installs.sh`
 
-Running the transformation from raw data to `ifp_cases.csv` is accomplished with:
+running the transformation from raw data to `ifp_cases.csv` is accomplished with:
 
 `$ python build_judge_ifp_data.py`
 
-Running the transformation from the csv file to the figure is accomplished with:
+running the transformation from the csv file to the figure is accomplished with:
 
 `$ do figure1_script.do`
 
-# Overview
+# overview
 
-## Raw data collection and availability
+## raw data collection and availability
 
-We queried the PACER CM/ECF system for all cases filed between Jan. 1st to December 31st in 2016. We
+we queried the pacer cm/ecf system for all cases filed between jan. 1st to december 31st in 2016. we
 then downloaded the dockets for all cases with a “cv” or “cr” designation that were the main case
-filing directly from PACER CM/ECF that were not already contained in the Free Law Project’s RECAP
+filing directly from pacer cm/ecf that were not already contained in the free law project’s recap
 database.
 
-As of June 1st, 2020 the raw data is currently being prepared for public usage and distribution
-through the SCALES Open Knowledge Network. That preparation entails ensuring protections for
-individual privacy and sensitive personal information that is contained in the raw data itself. Updates on
-availability will be given both here and on the [SCALES OKN](http://www.scales-okn.org) website. If
-you have a time-sensitive need for data access, please e-mail [Adam
-Pah](mailto:a-pah@kellogg.northwestern.edu) and [Aleksandra Mechetner](mailto:aleksandra.mechetner@northwestern.edu).
+as of june 1st, 2020 the raw data is currently being prepared for public usage and distribution
+through the scales open knowledge network. that preparation entails ensuring protections for
+individual privacy and sensitive personal information that is contained in the raw data itself. updates on
+availability will be given both here and on the [scales okn](http://www.scales-okn.org) website. 
+
+## Exploitation of case assignment as a RCT
+
+Case assignment to a judge is effectively randomized after a case is filed. There are a few situations where this is 
+not the case, but these situations are largely rare and predominantly occur for two technical
+reasons.  The two main reasons are (1) cases that are exceptionally procedurally
+complex are sometimes assigned to a judge with expertise in handling such cases; and (2) judges
+who take senior status (a kind of semi-retirement) have some control over their docket (though they
+see much fewer cases than non-senior-status judges). Fortunately, the number of cases that fall
+under one of thees two reasons are both small and unlikely to involve a petition for *in forma
+pauperis*. 
+
 
 ## Identification of *in forma pauperis* and outcomes
  
@@ -66,6 +76,23 @@ commonly used name. We attempt all possible matches of name `i` being a substrin
 name `j` is drawn from the list of all judge names. If there is only one match between a name as a
 substring and a larger substring, we match the short name to the long name. If there are no or
 multiple possible substring matches, then we do not make a match return `None` as the name.
+
+### Run options for `build_judge_ifp_data.py`
+
+By default `build_judge_ifp_data.py` will follow the methods outlined above, which will replicate
+the figure and analysis in the perspective. There are two options that will change attribution
+method as described.
+
+* `python build_judge_ifp_data.py --default_attr` -- will recognize that there are transfers but if
+  `spacy` cannot detect a PERSON entity in the docket passage then it will default to the judge
+  listed in the case metadata (i.e. the last recorded judge presiding over case). 
+* `python build_judge_ifp_data.py --no_transfer` -- ignores the fact that there are transfers and
+  defaults to attributing the case the judge listed in the case metadata.
+
+Figures for both approaches are in the repository with the corresponding option in the filename.
+Both options results in 37.63% of the judges differing from their district cohort, as opposed to ~40%
+when we attempt to identify the judge in a case with transfers. These numbers are derived from following 
+the same analysis and regression as specified in the perspective (`figure1_script.do`). 
 
 ## `ifp_cases.csv` file coding
 

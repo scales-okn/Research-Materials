@@ -285,7 +285,7 @@ def identify_judge(docket_block):
             judge_name = counted.most_common()[0][0]
     return judge_name
 
-def identify_judge_entries(docket, district, case_id, djudge):
+def identify_judge_entries(docket, district, case_id, djudge, default_attr=False, no_transfer=False):
     '''
     Attributes each docket entry to a judge
     input:
@@ -304,6 +304,9 @@ def identify_judge_entries(docket, district, case_id, djudge):
         for i, dline in enumerate(docket):
             if transfer_phrase in dline[-1]:
                 transfer_indices.append(i)
+    #Reset the transfer indices if we don't want any inference on transfers
+    if no_transfer == True:
+        transfer_indices = []
     #If there are transfers, divide it up
     if transfer_indices != []:
         #need to check against the last index being the last entry
@@ -325,7 +328,8 @@ def identify_judge_entries(docket, district, case_id, djudge):
                     docket_block = docket[block_index:end_index+1]
                 pjudge = identify_judge(docket_block)
                 if pjudge==' ':
-                    print(case_id, 'blank judge')
+                    if default_attr == True:
+                        pjudge = djudge
                 judge_ind_entries += [ map(nonetype_sanitizer, [district, case_id, clean_name(pjudge,punc=False), [0], x[-1]]) \
                                        for x in docket ]
     #Only one judge
@@ -355,14 +359,14 @@ def identify_judge_entries(docket, district, case_id, djudge):
                                for x in docket ]
     return judge_ind_entries
 
-def main(args):
+def main(infile, default_attr=False, no_transfer=False):
     '''
     Processes all unique filepaths detected
     '''
     # Dataset
     dataset = []
     # File handler
-    for jfhandle in [x.strip() for x in open('unique_docket_filepaths.txt').readlines()]:
+    for jfhandle in [x.strip() for x in open(infile).readlines()]:
         #Load the data files directly to pull out the data
         if 'recap' in jfhandle:
             jdata = remap_recap_data(jfhandle)
@@ -377,7 +381,7 @@ def main(args):
         #Process into the individual docket entries if ifp exists
         if line_num < 9999:
             print(jfhandle)
-            ind_entries = identify_judge_entries(jdata['docket'], jdata['download_court'], jdata['case_id'], jdata['judge'])
+            ind_entries = identify_judge_entries(jdata['docket'], jdata['download_court'], jdata['case_id'], jdata['judge'], default_attr = default_attr, no_transfer = no_transfer)
             df = pd.DataFrame(ind_entries, columns = columns)
             possible_ifp_motions = list(df.entry_text.apply(ifp_grant_identification))
             #try to find the index where it was granted
@@ -418,13 +422,23 @@ def main(args):
                 resolution = 0
             #Build the dataset
             dataset.append( [df.iloc[line_num].jurisdiction, df.iloc[line_num].case_id, judge_name, entry_date, resolution] )
-    #Conver to dataframe and save
+    #Convert to dataframe and save
     ifp_df = pd.DataFrame(dataset, columns = ifp_columns)
     final_df = ifp_dtools.process_dataframe(ifp_df)
-    final_df.loc[:, ['jurisdiction', 'case_id', 'hash_name', 'entry_date', 'resolution', 'total_decisions']].to_csv('ifp_cases.csv')
+    #Make the name
+    save_fhandle = 'ifp_cases'
+    if default_attr == True:
+        save_fhandle += '_default_attr'
+    if no_transfer == True:
+        save_fhandle += '_no_transfer'
+    save_fhandle += '.csv' 
+    final_df.loc[:, ['jurisdiction', 'case_id', 'hash_name', 'entry_date', 'resolution', 'total_decisions']].to_csv(save_fhandle)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="")
+    parser.add_argument('--infile', action='store', default='unique_docket_filepaths.txt')
+    parser.add_argument('--default_attr', action='store_true', default=False)
+    parser.add_argument('--no_transfer', action='store_true', default=False)
     args = parser.parse_args()
-    main(args)
+    main(args.infile, default_attr = args.default_attr, no_transfer = args.no_transfer)
