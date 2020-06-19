@@ -38,6 +38,13 @@ see much fewer cases than non-senior-status judges). Fortunately, the number of 
 under one of thees two reasons are both small and unlikely to involve a petition for *in forma
 pauperis*. 
 
+See the following for in depth discussion of the issue:
+* Bird, Susan Willett. "The Assignment of Cases to Federal District Court Judges." Stan L. Rev. 27 (1974): 475.
+
+* Eisenberg, Theodore, Talia Fisher, and Issi Rosen‐Zvi. "Does the judge matter? Exploiting random assignment on a court of last resort to assess judge and case selection effects." Journal of Empirical Legal Studies 9, no. 2 (2012): 246-290.
+
+* Klerman, Daniel, and Greg Reilly. "Forum selling." S. Cal. L. Rev. 89 (2015): 241.
+
 
 ## Identification of *in forma pauperis* and outcomes
  
