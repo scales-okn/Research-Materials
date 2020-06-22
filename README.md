@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/271897345.svg)](https://zenodo.org/badge/latestdoi/271897345)
+
 # Research-Materials
 
 Replication materials for SCALES OKN related empirical research and posts. To read more go to [SCALES
