@@ -15,17 +15,12 @@ running the transformation from the csv file to the figure is accomplished with:
 
 # Overview
 
-## Raw data collection and availability
+## Raw data collection
 
-we queried the pacer cm/ecf system for all cases filed between jan. 1st to december 31st in 2016. we
+We queried the Pacer CM/ECF system for all cases filed between Jan. 1st to December 31st in 2016. We
 then downloaded the dockets for all cases with a “cv” or “cr” designation that were the main case
 filing directly from pacer cm/ecf that were not already contained in the free law project’s recap
 database.
-
-as of june 1st, 2020 the raw data is currently being prepared for public usage and distribution
-through the scales open knowledge network. that preparation entails ensuring protections for
-individual privacy and sensitive personal information that is contained in the raw data itself. updates on
-availability will be given both here and on the [scales okn](http://www.scales-okn.org) website. 
 
 ## Exploitation of case assignment as a RCT
 
