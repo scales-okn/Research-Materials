@@ -1,0 +1,15 @@
+.DS_Store
+data/*
+**/*.auth
+*.pyc
+*.key
+noacri.db
+**/.ipynb_checkpoints/*
+**/_examples/*
+**/_misc.ipynb
+**/login.auth
+**/*.auth
+.vscode/*
+**/_temp_/*
+code/downloader/test/*
+**/geckodriver.log
