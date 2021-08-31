@@ -15,6 +15,7 @@ from selenium.webdriver import FirefoxOptions
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from support import settings
 from support import data_tools as dtools
+from support import docket_entry_identification as dei
 
 # Default runtime hours
 PACER_HOURS_START = 20
@@ -58,7 +59,7 @@ re_mdl_caseno_condensed = rf"{rg('year')}-?{rg('case_type')}-?{rg('case_no')}"
 
 # Misc re
 re_no_docket = r'(There are )?(P|p)roceedings for case .{1,50} (but none satisfy the selection criteria|are not available)'
-re_members_block = r"Member cases: <table [\s\S]+?</table>"
+re_members_block = r"(?s)Member cases?: (?:<table .+?</table>|<a.+?</a>)"
 
 def decompose_caseno(case_no, pattern=re_case_no_gr):
     ''' Decompose a case no. of the fomrat "2:16-cv-01002-ROS" '''
@@ -129,9 +130,21 @@ def main_limiter(case_no):
         else:
             return True
 
-def build_case_id(decomposed_case, allow_def_stub=False):
-    ''' Build a standard case_id from a decomposed case'''
+def build_case_id(decomposed_case, allow_def_stub=False, lower_type=False):
+    '''
+
+    Build a standard case_id from a decomposed case (ie. from the output of decompose_caseno)
+
+    Inputs:
+        - decomposed_case (dict): the dictionary of decomposed case parts, expects the result of decompose_caseno
+        - allow_def_stub (bool): whether or not to allow defendantstubs as part of case id
+        - lower_type (bool): whether to transform case type to lower case
+    Output:
+        (str) - a case id e.g. "1:16-cv-00001"
+    '''
     c = decomposed_case
+    if lower_type:
+        c['case_type'] = c['case_type'].lower()
     case_id = rf"{c['office']}:{c['year']}-{c['case_type']}-{c['case_no']:0>5}"
 
     if allow_def_stub and c['def_no']:
@@ -148,19 +161,20 @@ def colonize(case_no):
 def decolonize(case_no):
     return case_no.replace(':', '-', 1)
 
-def clean_case_id(case_no, allow_def_stub=False):
+def clean_case_id(case_no, allow_def_stub=False, lower_type=False):
     '''
     Takes a listed case name and clean anything that isn't the office,year, case type, and case no
     Inputs:
-        case_no (str): name of the case from the query
-        allow_def_stub (bool): allow individual defendant docket stubs e.g. {case_name}-1 for defendant 1,
+        - case_no (str): name of the case from the query
+        - allow_def_stub (bool): allow individual defendant docket stubs e.g. {case_name}-1 for defendant 1
+        - lower_type (bool): whether to transform case type to lower case
     Outputs:
-        Cleaned standardised name
+        (str) cleaned standardised name
     '''
     case_no = colonize(case_no)
     try:
         case = decompose_caseno(case_no)
-        return build_case_id(case, allow_def_stub=allow_def_stub)
+        return build_case_id(case, allow_def_stub=allow_def_stub, lower_type=lower_type)
 
     except ValueError:
         return case_no
@@ -258,18 +272,28 @@ def generate_document_fname(doc_id, user_hash, ext='pdf'):
 def parse_document_fname(fname):
     ''' Parse a document filename, return the component parts as a dict'''
 
+    res = {}
+
     re_doc_id = r"(?P<ucid_no_colon>[a-z0-9;\-]+)_(?P<index>\d+)(_(?P<att_index>\d+))?"
     re_download_name = rf"(?P<doc_id>{re_doc_id})_u(?P<user_hash>[a-z0-9]+)_t(?P<download_time>[0-9\-]+)\.(?P<ext>.+)"
     re_old = rf"(?P<doc_id>{re_doc_id})(?P<ext>.+)" #old format
 
+    # Try standard name first
     match = re.match(re_download_name,fname)
+    # If not, try the old naming system
     if not match:
         match = re.match(re_old, fname)
+
     if match:
         res = match.groupdict()
         res['ucid'] = res['ucid_no_colon'].replace('-',':',1)
         del res['ucid_no_colon']
-        return res
+
+    # Parse the date
+    if res.get('download_time'):
+        res['download_time'] = datetime.strptime(res['download_time'], FMT_TIME_FNAME)
+
+    return res
 
 
 def remap_date_year_backwards_to_forwards(xdate):
@@ -298,6 +322,26 @@ def extract_query_termdate(query_date_str):
     else:
         return None
 
+def build_empty_docket_table(soup):
+
+    date_filed = soup.new_tag('td', style="font-weight:bold; width=94; white-space:nowrap")
+    date_filed.string = 'Date Filed'
+
+    ind = soup.new_tag('th')
+    ind.string = '#'
+
+    docket_text = soup.new_tag('td', style="font-weight:bold")
+    docket_text.string = 'Docket Text'
+
+    dtable = soup.new_tag('table', align="center", border="1", cellpadding="5", cellspacing="0", rules="all", width="99%")
+
+    # Header
+    header = soup.new_tag('tr')
+    dtable.append(header)
+    for el in (date_filed, ind, docket_text):
+        header.append(el)
+
+    return dtable
 
 def docket_aggregator(fpaths, outfile=None):
     '''
@@ -309,6 +353,7 @@ def docket_aggregator(fpaths, outfile=None):
         - outfile (str or Path): output html file path
     Output:
         - soup (bs4 object) - the aggregated html as a soup object
+        - extra (dict): a dictionary of extra data
     '''
     from bs4 import BeautifulSoup
 
@@ -321,12 +366,45 @@ def docket_aggregator(fpaths, outfile=None):
 
     rows = []
 
-    for fpath in fpaths:
-        soup = BeautifulSoup(open(fpath).read(), "html.parser")
-        docket_table = soup.select('table')[-2]
-        rows.extend(docket_table.select('tr')[1:])
+    # Extra data to be returned (from non-htmls)
+    extra = {
+        'recap_docket': [],
 
-    # Use the last soup as the base
+    }
+
+    for fpath in fpaths:
+        fpath = Path(fpath)
+        if fpath.suffix == '.html':
+
+            soup = BeautifulSoup(open(fpath, 'r', encoding='utf-8').read(), "html.parser")
+
+            tables = soup.select('table')
+            docket_table = None
+            if len(tables) >= 2:
+                docket_table = tables[-2]
+                if dei.is_docket_table(docket_table):
+                    rows.extend(docket_table.select('tr')[1:])
+
+        # Assuming json implies recap
+        elif fpath.suffix == '.json':
+            rjdata = dtools.remap_recap_data(fpath)
+            # Grab the recap docketlines
+            extra['recap_docket'].extend(rjdata['docket'])
+            extra['recap_id'] = rjdata.get('recap_id')
+
+
+    # Check if need to create empty docket table for most recent docket (otherwise uses newest docket)
+    if not dei.is_docket_table(docket_table):
+        docket_table = build_empty_docket_table(soup)
+        # Find "There are proceedings" text
+        try:
+            replace_tag = soup.select('h2[align="center"]')[-1]
+        except:
+            # Fallback, use last horizontal line
+            replace_tag = soup.select('hr')[-1]
+        replace_tag.replace_with(docket_table)
+
+    # Insert all the rows
     header_row = docket_table.select_one('tr')
     docket_table.clear()
     docket_table.append(header_row)
@@ -343,7 +421,7 @@ def docket_aggregator(fpaths, outfile=None):
         with open(outfile, 'w', encoding="utf-8") as wfile:
             wfile.write(str(soup))
 
-    return soup
+    return soup, extra
 
 def doc_id_from_pdf_header(fpath):
     '''
@@ -356,7 +434,17 @@ def doc_id_from_pdf_header(fpath):
         - att_ind (str): the attachment index (None if it is not an attachment)
     '''
     import PyPDF2 as pp
-    re_header = r"Case: (?P<case_no>\S+) Document #: (?P<row_ind>\d+)(\-(?P<att_ind>\d+))?"
+    # re_header = r"case:? (?P<case_no>\S+) document #?:?\s*(?P<row_ind>\d+)(\-(?P<att_ind>\d+))?"
+    re_doc_header_stamp = re.compile(rf"""
+        (?P<caseno>{re_case_no_gr})  # the case no
+        [^\d]+    # any non digit
+        (?P<doc_no>\d+) # the document no. just using the first digits found
+        (\-(?P<att_index>\d+))?
+        """,
+        flags=re.X|re.I
+    )
+    re_entry_no = r"entry n[a-z]+ (?P<entry_no>\d+)(\-?P<att_index>\d+)?"
+    re_doc = r'document (?P<doc_no>\d+)(\-?P<att_index>\d+)?'
 
     with open(fpath, 'rb') as f:
         pdf = pp.PdfFileReader(f, 'rb')
@@ -364,11 +452,23 @@ def doc_id_from_pdf_header(fpath):
 
         #Edge case of document without stamp
         try:
-            parsed = re.search(re_header,stamp).groupdict()
+            stamp = re.sub('\s\s+',' ', stamp)
+            stamp = stamp[-100:]
+
+            res = re.search(re_doc_header_stamp, stamp).groupdict()
+            for match_doc in re.finditer(re_doc, stamp, re.I):
+                res['doc_no'] = match_doc.groupdict()['doc_no']
+                res['att_index'] = match_doc.groupdict().get('att_index') or None
+
+            # Overwrite with the 'last' match for Entry number __
+            for match_entry in re.finditer(re_entry_no, stamp, re.I):
+                res['doc_no'] = match_entry.groupdict()['entry_no']
+                res['att_index'] = match_entry.groupdict().get('att_index') or None
+
         except:
             return None,None,None
 
-    return parsed['case_no'], parsed['row_ind'], parsed['att_ind']
+    return res['caseno'], res['doc_no'], res.get('att_ind')
 
 def get_correct_document_id(fpath, court):
     '''
@@ -473,28 +573,110 @@ def get_pacer_url(court, page):
     elif page == 'summary':
         return base_url + 'cgi-bin/qrySummary.pl'
 
-def get_expected_path(ucid, ext='json', pacer_path=settings.PACER_PATH, def_no=None):
+def get_expected_path(ucid, ext=None, subdir=None, pacer_path=settings.PACER_PATH, def_no=None):
     '''
-    Find the expected path of the json or html file for the case
+    Find the expected path of case-level data files
 
     Inputs:
         - ucid (str): case ucid
-        - ext (str): 'json' or 'html'
+        - ext (str): file extension for path, 'json' or 'html'
+        - subdir (str): the subdirectory to look in (see scrapers.PacerCourtDir), one of 'html', 'json', 'docs', 'summaries', 'members'
         - pacer_path (Path): path to pacer data directory
+        - def_no (str or int): the defendant no., if specifying a defendant-specific docket
     Output:
         (Path) the path to where the file should exist (regardless of whether it does or not)
 
     '''
-    if ext not in ('html', 'json'):
-        raise ValueError("ext must be either 'html' or 'json'")
+    #Handle a bunch of defaults and backwards compatibility
+
+    # Defaults to case json
+    if (ext==None and subdir==None) or (ext=='json') or (subdir=='json'):
+        ext, subdir = 'json', 'json'
+
+    # Set ext to 'html' for summaries and members
+    elif subdir in ('summaries', 'members'):
+        ext, subdir = 'html', subdir
+
+    # If ext is 'html', subdir defaults to 'html'
+    elif ext=='html' or subdir=='html':
+        ext, subdir = 'html', 'html'
+
 
     ucid_data = dtools.parse_ucid(ucid)
     court, case_no = ucid_data['court'], ucid_data['case_no']
     fname = generate_docket_filename(case_no, ext=ext, def_no=def_no)
 
-    return pacer_path / court / ext / fname
+    return pacer_path / court / subdir / fname
 
 def filename_to_ucid(fname, court):
     fpath = Path(fname)
     case_id = clean_case_id(fpath.stem)
     return dtools.ucid(court, case_id)
+
+def build_sel_filename_from_ucid(ucid):
+    year = ucid.split(";;")[1].split(":")[1][0:2]
+    # court is the first sub-directory within the SEL_dor
+    court = ucid.split(';;')[0]
+    # replace the colons and semi-colons with dashes
+    fbase = ucid.replace(';;','-').replace(':','-') +'.jsonl'
+    fname = settings.DIR_SEL / court / year / fbase
+
+    return fname
+
+def get_doc_path(doc_id):
+    '''
+    Get path for a single document, if it exists
+    Note: note very performant for large number of calls, if checking multiple use get_doc_path_many
+    Input:
+        - doc_id (str): a single document id e.g. 'ilnd;;1-16-cv-02872_110'
+    Output:
+        - (Path) returns the path to the document pdf if it exists e.g. Path('.../ilnd/docs/ilnd;;1-16-cv-002872_110_u123131_t123123.pdf'),
+            otherwise returns None if document does not exist
+    '''
+    # Get the court from the doc_id
+    court = doc_id.split(';;')[0]
+
+    # Use glob to get candidate list (will return attachments with subindexes e.g. "_3...", "_3_1...", "_3_2...")
+    cand = (settings.PACER_PATH/court/'docs').glob(doc_id+'*')
+    # Filter to the correct doc id
+    for fpath in cand:
+
+        cand_id = parse_document_fname(fpath.name).get('doc_id') or None
+        if cand_id==doc_id:
+            return fpath
+
+
+def get_doc_path_many(doc_idx, court):
+    '''
+    Get path to pdf documents for multiple document ids at once, within a single court
+    Note: much more performant for multiple calls within same court than get_doc_path
+    Input:
+        - doc_idx (pd.Series or iterable): an iterable of doc_idx e.g. ('nmid;;1-16-cv-00009_7','nmid;;1-16-cv-00019_1')
+            where each is a string. If iterable is not a pandas Series (most efficient) it will be converted to one
+        - court (str): a single court abbreviation e.g. 'nmid', Note: all values in doc_idx should be from the same court
+    Output:
+        (pd.Series) a Series of same length as doc_idx, with values of type Path
+    '''
+
+    # Get all pdf filepaths within the docs subdirectory for the given court
+    it = (settings.PACER_PATH/court/'docs').glob('*.pdf')
+
+    # Grab the doc id's from the filenames
+    df = pd.DataFrame(it, columns=('existing_fpath',))
+    df['doc_id'] = df.existing_fpath.apply(lambda x: parse_document_fname(x.name).get('doc_id') or None)
+
+    # Create a lookup series
+    if not df.doc_id.is_unique:
+        duplicated = df.doc_id.duplicated(keep='last')
+        n_duplicated = sum(duplicated)
+        print(f'get_doc_path_many({court=}): Found duplicates ({n_duplicated})')
+        df = df[~duplicated]
+
+    lookup = df.set_index('doc_id').existing_fpath
+
+    # Convert doc_idx to a Series, if it's not already
+    if type(doc_idx) != pd.Series:
+        doc_idx = pd.Series(doc_idx)
+
+    # Return the mapping from input doc ids to found fpaths
+    return doc_idx.map(lookup)

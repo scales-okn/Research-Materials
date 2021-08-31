@@ -1,5 +1,5 @@
-import sys
 import re
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -7,7 +7,10 @@ import pandas as pd
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from support import settings
 from support import data_tools as dtools
+from support import court_functions as cfunc
 from support import fhandle_tools as ftools
+
+re_header_case_id = re.compile('DOCKET FOR CASE #: [A-Za-z0-9 :\-]{1,100}')
 
 # Import the nature of suit Spreadsheet
 df_nos = pd.read_csv(settings.NATURE_SUIT)
@@ -507,201 +510,54 @@ def mdl_code_from_casename(casename):
     if casename_data['case_type'].lower() in ['md','ml', 'mdl']:
         return int(casename_data['case_no'])
 
-# MDL deprectated?
-# def get_mdl_code(mdl_data, html_string=None, case=None):
-#     '''
-#     Identify the mdl_code for a case. Must supply either html_string or case
-#
-#     Inputs:
-#         fpath (str or Path): filepath for the case
-#         mdl_data (dict): the output from mdl_check method
-#         html_string (str): the html string for the case
-#         case (dict): the case json data from dtools.load_case
-#     Output:
-#         code (int): the mdl code
-#         source_code (str): the source used to identify the code
-#     '''
-#
-#     if not (html_string or case):
-#         raise ValueError('Must supply either html_string or case')
-#
-#
-#     # Check lead case
-#     lead_case_id = mdl_data.get('lead_case_id')
-#     if lead_case_id:
-#         code = mdl_code_from_casename(lead_case_id)
-#         if code:
-#             return (code, 'lead_case_id')
-#
-#     # Check html for flags or other reference
-#     if html_string:
-#         flags = get_case_flags(html_string)
-#         if flags:
-#             code = mdl_code_from_string(flags)
-#             if code:
-#                 return (code, 'flag')
-#
-#         # Check rest of html for string
-#         code = mdl_code_from_string(html_string)
-#         if code:
-#             return  (code, 'html_string')
-#
-#     elif case:
-#         # Check idb_mdl
-#         code = case.get('mdl_code')
-#         if code:
-#             return (code, 'idb_mdl_docket')
-#         # Check if it's an mdl case
-#         casename = case.get('case_id')
-#         code = mdl_code_from_casename(casename)
-#         if code:
-#             return (code, 'casename')
-#
-#         # Search the docket
-#         docket = case.get('docket')
-#
-#         if docket and len(docket[0])==3:
-#             try:
-#                 for line in docket:
-#                     code = mdl_code_from_string(line[2])
-#                     if code:
-#                         return (code, 'docket')
-#             except:
-#                 pass
-#
-#     return None,None
-#
-# def identify_mdl_from_json_data(case):
-#     ''' MDL identification based on idb fields in case json and from docket lines'''
-#     is_multi_idb = (case['origin'] in [6,13] or case['disposition']==10 or case['mdl_docket'])
-#     if is_multi_idb:
-#         mdl_data = {
-#             'is_multi': True,
-#             'origin': 'internal' if case['origin']==13 else \
-#                        'external' if case['origin']==6 else None,
-#             'disposition': (case['disposition']==10), # disposed of by mdl,
-#             'mdl_docket_no': case['mdl_docket'],
-#             'recap_mdl_status': case['mdl_status'],
-#             'source_identification': 'json'
-#         }
-#     else:
-#         mdl_data = {'is_multi': False}
-#
-#     # Check for code regardless (may identify based on docket)
-#     mdl_data['mdl_code'], mdl_data['source_code']= get_mdl_code(mdl_data, case=case)
-#     # Coerce is_multi, make it true if mdl_code found
-#     mdl_data['is_multi'] = mdl_data['is_multi'] or  (mdl_data['mdl_code'] != None)
-#
-#     return mdl_data
-#
-# def identify_mdl_from_html(html):
-#     ''' MDL identification based on case html'''
-#
-#     def id_from_atag(tag_string):
-#         ''' Get the case no. from within an <a> tag '''
-#         return tag_string.split('</a>')[0].split('>')[-1]
-#
-#
-#     idx_filed = html.index('date filed')
-#     re_mdl_flag = "(?<![a-z])mdl(?![a-z])"
-#     case_flags = get_case_flags(html)
-#     flag_found = bool(re.search(re_mdl_flag, get_case_flags(html), re.I)) if case_flags else False
-#
-#     if not (flag_found or re.search('member cases?|case in other court', html[:idx_filed])):
-#         return {'is_multi': False}
-#
-#     # Start from member cases link to avoid lead case
-#     try:
-#         idx_member = html.index('member case')
-#         truncated_member_list = bool(re.search(ftools.re_members_truncated, html[idx_member:idx_filed], re.I) )
-#         member_cases = [id_from_atag(atag) for atag in re.findall(ftools.re_case_link, html[idx_member:idx_filed], re.I)]
-#         has_member_cases = truncated_member_list or len(member_cases)
-#
-#         lead_case_link = re.search(ftools.re_lead_link, html[:idx_filed], re.I)
-#         lead_case_id = id_from_atag(lead_case_link.group()) if lead_case_link else None
-#     except ValueError:
-#         member_cases, lead_case_link, lead_case_id = None,None,None
-#         has_member_cases = False
-#
-#     # Get the "Case in other court: {court}, {case} data"
-#     other_court_line_match = re.search(ftools.re_other_court, html[:idx_filed], re.I)
-#     if other_court_line_match:
-#         try:
-#             # Extract the text
-#             other_court_line = other_court_line_match.group().split('</td>')[-2].split('<td>')[-1].strip()
-#             # Separate the court from the case no.
-#             vals = [x.strip() for x in other_court_line.split(',')[-2:]]
-#             other_court_court, other_court_case = vals
-#         except ValueError:
-#             other_court_court, other_court_case = None, vals[0]
-#     else:
-#         other_court_court, other_court_case = None, None
-#
-#     mdl_data = {
-#         'is_multi': True,
-#         'is_lead_case': (lead_case_id==None and has_member_cases),
-#         'has_member_cases': has_member_cases,
-#         'member_cases': member_cases,
-#         'lead_case_id': lead_case_id,
-#         'in_other_courts': bool(other_court_line_match),
-#         'other_court_court': other_court_court,
-#         'other_court_case': other_court_case,
-#         'source_identification': 'html' if not flag_found else 'flag'
-#     }
-#
-#     mdl_data['mdl_code'], mdl_data['source_code'] = get_mdl_code(mdl_data, html_string=html)
-#     return mdl_data
-#
-# def mdl_check(fpath, case_jdata=None):
-#     '''
-#     Check if a case is an MDL case and return relevant data
-#
-#     Inputs:
-#         fpath (str): the case fpath
-#     Outputs:
-#         mdl_data (dict) : data relating to the mdl
-#     '''
-#
-#     def exclude(mdl_data):
-#         ''' Scenario where a multi case is excluded from being an mdl'''
-#         return  mdl_data.get('in_other_courts') \
-#                 and not mdl_data.get('has_member_cases',False) \
-#                 and not mdl_data.get('lead_case_id')
-#
-#     # Recap
-#     if dtools.is_recap(fpath):
-#         case_jdata = dtools.load_case(fpath) if not case_jdata else case_jdata
-#         mdl_data = identify_mdl_from_json_data(case_jdata)
-#
-#     # Pacer
-#     else:
-#
-#         # Try html first
-#         case_html = dtools.load_case(fpath, html=True).replace('&nbsp;', ' ').lower()
-#         mdl_data_html = identify_mdl_from_html(case_html)
-#         if mdl_data_html['is_multi'] and mdl_data_html['mdl_code']:
-#             mdl_data = mdl_data_html
-#         else:
-#             # Then try idb from json
-#             case_jdata = dtools.load_case(fpath) if not case_jdata else case_jdata
-#             mdl_data_json = identify_mdl_from_json_data(case_jdata)
-#             if mdl_data_json['is_multi'] and mdl_data_json['mdl_code']:
-#                 mdl_data = mdl_data_json
-#
-#             # Otherwise: aggregate, prioritise html data
-#             else:
-#                 mdl_data = mdl_data_html
-#                 # Make sure is_multi returns true if either is true
-#                 mdl_data['is_multi'] = mdl_data_html['is_multi'] or mdl_data_json['is_multi']
-#                 mdl_data['source_identification'] = mdl_data_html.get('source_identification')  or mdl_data_json.get('source_identification')
-#
-#     # is_mdl true if identification comes from a flag
-#     if mdl_data.get('source_identification')=='flag' or mdl_data.get('source_code')=='flag':
-#         mdl_data['is_mdl'] = True
-#
-#     # Otherwise look at exclusion rule
-#     else:
-#         mdl_data['is_mdl'] = mdl_data['is_multi'] and not exclude(mdl_data)
-#
-#     return mdl_data
-#
+def is_docket_table(table):
+    '''
+    Identify a table as being a docket entry table
+    Inputs:
+        - table (bs4.element.Tag)
+    Output:
+        (bool) True if it's a docket table, False otherwise
+    '''
+    try:
+        first_cell_text = table.select_one('td').text.strip().lower()
+        return (first_cell_text == 'date filed')
+    except:
+        return False
+
+def extract_court_caseno(hstring, debug_name=''):
+    '''
+    Take the string of a docket report html and detect the caseno and court
+
+    Inputs:
+        - hstring (str): string of the docket report html
+        - debug_name (str): a debug name for the case to print out if it can't find them in the header
+    Output:
+        - court (str): court abbreviation for the court (runs through court_functions.classify)
+        - case_no (str): the uncleaned case_no for the case, can have judges initials e.g. "1:16-cv-00001-ABC-DEF"
+    '''
+
+    # Grab the "DOCKET FOR CASE: ......." text
+    header_match = re.search(re_header_case_id, hstring)
+    if not header_match:
+        print(f"Couldn't find case header in {debug_name}")
+        return
+
+    # Extract the case_no from that
+    case_no_match = re.search(ftools.re_case_name, header_match.group(0))
+    if not case_no_match:
+        print(f"Couldn't find case_no in header for {debug_name}")
+        return
+    else:
+        case_no = case_no_match.group(0)
+
+
+    # Grab the text from the start of the <h3> tag up until the "DOCKER FOR CASE" TEXT
+    ind = header_match.span()[0]
+    court_header_str = hstring[ind-200:ind].split('<h3',maxsplit=1)[1]
+
+    # Remove anything in parenthesis because division can interfere otherwise e.g. "California Central District (Western Division)" -> "cawd"
+    court_header_str = re.sub(r'\([^\)]+\)', '', court_header_str)
+    # Run it through the classifier
+    court = cfunc.classify(court_header_str)
+
+    return court, case_no

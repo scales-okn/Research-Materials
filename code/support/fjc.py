@@ -324,10 +324,6 @@ def idb_merge(idb_data_file, case_type, dframe=None):
 
     Inputs
         - idb_data_file (str or Path): the idb csv file to use e.g. 'cv10to19.csv'
-        # - years (list): list of ints of years e.g. [2016,2017]
-        - case_type ('cv' or 'cr')
-        # - year_buffer (int): no. of years +- to look in idb
-        #     e.g. if years=[2016] and year_buffer=1, idb data for (2015,2017) will be used
         - dframe (DataFrame): specify table of case files, instead of using all of unique files table
     Outputs
         - final (DataFrame): the merged table
@@ -335,7 +331,7 @@ def idb_merge(idb_data_file, case_type, dframe=None):
     '''
     if dframe is None:
         dff = dtools.load_unique_files_df()
-        dff = dff[dff.case_type.eq(case_type) & dff.year.isin(years)].copy()
+        dff = dff[dff.case_type.eq(case_type)].copy()
     else:
         dff = dframe.copy()
     N = dff.shape[0]
@@ -343,7 +339,7 @@ def idb_merge(idb_data_file, case_type, dframe=None):
 
     # Make sure there's a ucid column
     dff.reset_index(inplace=True)
-    dff['ucid_copy'] = dff['ucid']
+    dff['ucid_copy'] = dff['ucid'].copy()
 
     print(f'Loading idb file: {idb_data_file}...')
     df_idb = load_idb_csv(idb_data_file, case_type=case_type, cols=BARE_MIN_COLS)

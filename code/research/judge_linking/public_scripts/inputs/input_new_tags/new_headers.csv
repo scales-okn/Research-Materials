@@ -1,0 +1,7 @@
+,ucid,court,cid,year,filing_date,original_text,extracted_pretext,extracted_entity,Ent_span_start,Ent_span_end,Pre_span_start,Pre_span_end,docket_source,Entity_Extraction_Method,judge_enum,party_enum,pacer_id,docket_index
+269811,ilnd;;1:13-cv-04176,ilnd,1:13-cv-04176,2013,06/05/2013,Honorable Harry D. Leinenweber,Honorable,Harry D. Leinenweber,10,30,0.0,9.0,case_header,assigned_judge,0,,,
+270375,ilnd;;1:13-cv-04747,ilnd,1:13-cv-04747,2013,07/01/2013,Honorable John F. Grady,Honorable,John F. Grady,10,23,0.0,9.0,case_header,assigned_judge,0,,,
+282559,ilnd;;1:14-cv-06679,ilnd,1:14-cv-06679,2014,08/28/2014,Honorable Thomas M. Durkin,Honorable,Thomas M. Durkin,10,26,0.0,9.0,case_header,assigned_judge,0,,,
+315910,ilnd;;1:17-cv-02937,ilnd,1:17-cv-02937,2017,04/19/2017,Honorable Jeffrey Cole,Honorable,Jeffrey Cole,10,22,0.0,9.0,case_header,referred_judges,1,,,
+315911,ilnd;;1:17-cv-02937,ilnd,1:17-cv-02937,2017,04/19/2017,Honorable Martha M. Pacold,Honorable,Martha M. Pacold,10,26,0.0,9.0,case_header,assigned_judge,0,,,
+336165,ilnd;;1:19-cv-02702,ilnd,1:19-cv-02702,2019,04/22/2019,Honorable John Z. Lee,Honorable,John Z. Lee,10,21,0.0,9.0,case_header,assigned_judge,0,,,

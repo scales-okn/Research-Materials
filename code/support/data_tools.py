@@ -1,17 +1,23 @@
+# Standard path imports
 import re
 import sys
 import json
+import functools
+import asyncio
 import numpy as np
+import pandas as pd
 from pathlib import Path
 from itertools import chain, groupby
 from datetime import datetime
-
-import pandas as pd
 from tqdm.autonotebook import tqdm
+
+# Non-standard imports
+import usaddress
 import zlib
 import base64
 from hashlib import blake2b
 
+# SCALES modules
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from support import settings
 from support import docket_entry_identification as dei
@@ -46,7 +52,6 @@ def find_matching_lines(docket, phrases, exclusion_phrases=[], make_lowercase=Tr
                     line_ids.append(i)
             except (AttributeError, TypeError, KeyError): # retained from Adam's code
                 pass
-    # print(line_ids)
     return line_ids
 
 def has_edges(docket):
@@ -63,6 +68,17 @@ def get_edges_to_target(target_ind, edges):
                 matches.append(edge)
     return matches
 
+def remove_sensitive_info(docket):
+    '''
+    Take a docket (html or json) and remove social security numbers and A-numbers
+    '''
+    ssn_re = re.compile(r"(?i)([^0-9])((?:ssn?:?)? *#?\d{3}-\d{2}-\d{4})([^0-9])")
+    a_number_re = re.compile(r"(?i)([^0-9a-z])(a\d{8,9})([^0-9])")
+    redact_text = lambda match: match.group(1) + ' '*len(match.group(2)) + match.group(3)
+
+    docket = re.sub(ssn_re, redact_text, docket)
+    docket = re.sub(a_number_re, redact_text, docket)
+    return docket
 
 
 def create_docket_core(case_id):
@@ -196,15 +212,16 @@ def load_query_file(query_file, main_case=True):
 
 
 
-def line_detagger(string):
+def line_detagger(string, prettify=False):
     '''
     Removes HTML tags from text (for use in parse_pacer.py)
-    input: string (text to clean)
+    input: string (text to clean), prettify (boolean specifying whether to insert spaces in place of dropped tags)
     '''
+    delim = ' ' if prettify else ''
     if string != None:
         while string.count('***') > 1: # sometimes Pacer does, e.g., "***DO NOT FILE IN THIS CASE***"
             string = string.split('***')[0] + '***'.join(string.split('***')[2:])
-        return re.sub('\<[^<]+?>', '', string).strip('<>?! ') or None
+        return re.sub('\<[^<]+?>', delim, string).strip('<>?! ') or None
     else:
         return None
 
@@ -214,12 +231,75 @@ def line_cleaner(string):
     input: string (text to clean)
     '''
     if string != None:
-        string = string.replace('&amp;','&').replace('&nbsp;',' ').replace('\\\'','\'').replace('\\n','').replace('\\t','')
+        string = string.replace('&amp;','&').replace('&nbsp;',' ')
+        string = string.replace("\\'", "'").replace('\\n','\n').replace('\\t','\t')
         string = string.lstrip(')').rstrip('(')
-        string = ' '.join(string.split()).strip()
+        string = re.sub(' +', ' ', string)
+        string = string.strip()
         return string or None
     else:
         return None
+
+def lawyer_line_cleaner(string):
+    if string != None:
+        return string.split('<!--')[0].strip('/<> ')
+    else:
+        return None
+
+def parse_lawyer_lines(lines):
+    '''
+    Helper method for remap_recap_data() as well as process_entity_and_lawyers() in parse_pacer.py
+    Inputs:
+        - lines (list): the contents of the text block below a lawyer name in Pacer, split by line break
+    Outputs:
+        - office (str), address (list), phone (str), fax (str), email (str): all the possible components of the lawyer block, separated out
+    '''
+
+    def _is_address(line):
+        address_parse = usaddress.parse(line)
+        if address_parse and address_parse[0][1]!='Recipient': # 'Recipient' seems to be the default type in usaddress
+            false_positive = ('IntersectionSeparator' in [x[1] for x in address_parse]) or (' ' not in line)
+            return (not false_positive)
+        return False
+
+    office, address, phone, fax, email = [None]*5
+
+    # parse phone/fax/email (there should only be one of each, but just in case, walk backwards so as to choose the earliest one)
+    phone_ind, fax_ind, email_ind = None, None, None
+    for i,line in zip(range(len(lines)-1,-1,-1), lines[::-1]):
+        if re.match('(?:(?:1[\-\/\. ]?)?\(?[2-9]\d{2}\)?)?[\-\/\. ]?[2-9]\d{2}[\-\/\. ]?\d{4}$', line):
+            # make sure this phone-number match isn't an inmate number
+            if i==0 or not any((' ' in x for x in lines[:i])): # take a closer look at these suspicious matches
+                if i+1<len(lines) and not any((_is_address(x) for x in lines[i+1:])): # PACER-field-ordering rule
+                    phone, phone_ind = line, i
+            else:
+                phone, phone_ind = line, i
+        if 'Fax: ' in line:
+            fax, fax_ind = line.split('Fax: ')[1].lower().split(' fax')[0], i
+        if 'Email: ' in line:
+            email, email_ind = line.split('Email: ')[1], i
+
+    # parse address and office
+    address_end = min([x if x is not None else len(lines) for x in (phone_ind,fax_ind,email_ind)])
+    address_start = None
+    for i,line in enumerate(lines[:address_end]):
+        if _is_address(line):
+            address_start = i
+            break
+    if address_start is not None:
+        address = '\n'.join(lines[address_start:address_end])
+        office = '\n'.join(lines[:address_start])
+    else:
+        office = '\n'.join(lines[:address_end])
+
+    # clean office
+    null_words = ('above for address', 'undeliverable', 'expired', 'unknown')
+    if any((x in office.lower() for x in null_words)):
+        office = '\n'.join(list(filter(lambda line: not any((x in line.lower() for x in null_words)), office.split('\n'))))
+    if not office or office == '.':
+        office = None
+
+    return office, address, phone, fax, email
 
 def parse_extra_info(chunk, from_recap=False):
     '''
@@ -228,90 +308,257 @@ def parse_extra_info(chunk, from_recap=False):
         - chunk (str): a chunk of HTML text (split_chunk[0] when called from process_entity_and_lawyers())
         - from_recap (bool): whether the chunk came from a RECAP field (if it did, it's already been stripped of HTML tags)
     Outputs:
-        - extra_info (str): any info contained in the italicized text block below the party name in PACER
-        - terminating_date (str): a parsed-out date when the italicized text block specifies the 'TERMINATED' date
+        - extra_info (str): any info contained in the text block below the party name in Pacer
+        - terminating_date (str): a parsed-out date when the text block specifies the 'TERMINATED' date
+        - no_italics_in_ei (bool): for Pacer, specifies whether this extra info might actually be pro-se info (seems to happen in flsd, e.g. 9:16-cv-80411)
     '''
-    def _replace_breaks_with_spaces(string, from_recap):
+    def _replace_breaks_with_newlines(string):
         if string != None:
-            breaks_re = '\n' if from_recap else '<br>|<br/>|<br />'
-            return re.sub(breaks_re, ' ', string)
+            return re.sub('<br>|<br/>|<br />', '\n', string)
         else:
             return None
 
+    # isolate the extra-info block
     delim = 'TERMINATED: '
-    extra_info = _replace_breaks_with_spaces(chunk,from_recap) if from_recap else ( line_detagger(_replace_breaks_with_spaces(
-        '<i>'.join(chunk.split('<i>')[1:]).split('</td>')[0],from_recap)) if '<i>' in chunk else None )
     terminating_date = None
-    while extra_info and delim in extra_info: # this loop will take whichever terminating date is encountered last in the italicized string
-        terminating_date = delim.join(extra_info.split(delim)[1:])
-        if len(extra_info.split(delim)[0]) > 0 or ' ' in terminating_date: # is there any extra info besides the terminating date?
-            extra_info = extra_info.split(delim)[0] + ' '.join(terminating_date.split(' ')[1:])
-            terminating_date = terminating_date.split(' ')[0]
-        else:
-            extra_info = extra_info.split(terminating_date)[1]
-
-    if extra_info and (len(extra_info) == 0 or extra_info == 'and'):
-        extra_info = None
-    extra_info = line_cleaner(extra_info)
-    extra_info = [extra_info] if extra_info else None # convert extra_info to list (like role name) to handle parties listed w/multiple titles
-    return extra_info, line_cleaner(terminating_date)
-
-def update_party(party_dict, name, new_party):
-    '''
-    Update a party dictionary with info about a newly parsed party, merging this info with existing info about the same party if necessary
-    Inputs:
-        - party_dict (dict): one of the five party dictionaries in the SCALES parse schema (plaintiff, defendant, bk_party, other_party, misc)
-        - name (str): the name of the person/corporation/etc comprising this party, to be used as a key into party_dict
-        - new_party (dict): the info we want to add, which (in this implementation) will be a dict containing 'roles', 'is_pro_se', 'counsel', 'terminating_date', & 'extra_info'
-    Outputs:
-        - party_dict (dict): the passed-in party dictionary updated with the new info
-    '''
-    if name not in party_dict.keys():
-        party_dict.update(new_party)
+    if not from_recap:
+        test_for_ei = chunk.split('</td>')[0]
+        ei_prelim = line_detagger(_replace_breaks_with_newlines(chunk.split('<br',1)[1])) if '<br' in test_for_ei else None
     else:
-        old = party_dict[name]
-        new = new_party[name]
+        ei_prelim = chunk
 
-        old['roles'] += new['roles']
-        old['is_pro_se'] = (old['is_pro_se'] or new['is_pro_se'])
+    # take whichever terminating date is encountered last in the block (most likely use case: multiple AKAs w/ same term date for each)
+    while ei_prelim and delim in ei_prelim:
+        terminating_date = ei_prelim.split(delim,1)[1]
+        ei_prelim = ei_prelim.split(delim,1)[0]
+        if '\n' in terminating_date: # is there any extra info besides the terminating date?
+            ei_prelim += terminating_date.split('\n',1)[1]
+            terminating_date = terminating_date.split('\n')[0]
 
-        if not bool(old['counsel']):
-            old['counsel'] = new['counsel']
-        else:
-            old['counsel'].update(new['counsel'] or {})
+    # clean up the results
+    extra_info = line_cleaner(ei_prelim)
+    if not extra_info or extra_info == 'and':
+        extra_info = None
+    else:
+        extra_info = '\n'.join( list(filter(None, [line_cleaner(x) for x in extra_info.split('\n')] )))
+        extra_info = extra_info.strip('\n/<> ')
 
-        date_delta = difference_in_dates(new['terminating_date'], old['terminating_date'])
-        if date_delta and date_delta>0:
-            old['terminating_date'] = new['terminating_date']
+    # decide whether this extra info qualifies as "no-italics," which often indicates that it contains address info
+    italics_test = ''.join(chunk.split('<i>TERMINATED')) if '<i>TERMINATED' in chunk else chunk
+    no_italics_in_ei = not from_recap and extra_info and '<i>' not in italics_test
 
-        if not bool(old['extra_info']):
-            old['extra_info'] = new['extra_info']
-        elif bool(new['extra_info']):
-            for ei in new['extra_info']:
-                if ei not in old['extra_info']:
-                    old['extra_info'].append(ei)
+    return extra_info or None, line_cleaner(terminating_date), no_italics_in_ei
 
-    return party_dict
+# def update_party(party_dict, name, new_party):
+#     '''
+#     DEPRECATED - uses the old party-dictionary format, and hasn't been updated because we no longer merge party blocks with the same name
+#     Update a party dictionary with info about a newly parsed party, merging this info with existing info about the same party if necessary
+#     Inputs:
+#         - party_dict (dict): one of the five party dictionaries in the SCALES parse schema (plaintiff, defendant, bk_party, other_party, misc)
+#         - name (str): the name of the person/corporation/etc comprising this party, to be used as a key into party_dict
+#         - new_party (dict): the info we want to add, which (in this implementation) will be a dict containing 'roles', 'is_pro_se', 'counsel', 'terminating_date', & 'extra_info'
+#     Outputs:
+#         - party_dict (dict): the passed-in party dictionary updated with the new info
+#     '''
+#     if name not in party_dict.keys():
+#         party_dict.update(new_party)
+#     else:
+#         old = party_dict[name]
+#         new = new_party[name]
+
+#         old['roles'] += new['roles']
+#         old['is_pro_se'] = (old['is_pro_se'] or new['is_pro_se'])
+
+#         if not old['counsel']:
+#             old['counsel'] = new['counsel']
+#         else:
+#             old['counsel'].update(new['counsel'] or {})
+
+#         if not old['terminating_date'] or (new['terminating_date'] and difference_in_dates(new['terminating_date'],old['terminating_date'])>0):
+#             old['terminating_date'] = new['terminating_date']
+
+#         if not old['extra_info']:
+#             old['extra_info'] = new['extra_info']
+#         elif new['extra_info']:
+#             for ei in new['extra_info']:
+#                 if ei not in old['extra_info']:
+#                     old['extra_info'].append(ei)
+
+#     return party_dict
+
+
 
 def remap_recap_data(recap_fpath=None, rjdata=None):
     '''
-    Given a recap file, normalizes the process
-    * recap_fpath
-    output:
-    *jdata
+    Converts a Recap-style case JSON to a SCALES-style case JSON
+    Input: a path to a Recap file (recap_fpath), or the JSON object itself (rjdata)
+    output: the same data reformatted to fit the SCALES parse schema
     '''
 
-    def standardize_date(tdate):
-        '''y-m-d to m/d/y'''
-        if not tdate:
-            return None
-        try:
-            y,m,d = tdate.split('-')
-            return '/'.join([m, d, y])
-        except AttributeError:
-            return None
+    def _get_recap_parties(rparties):
+        with open(settings.ROLE_MAPPINGS, 'r') as f:
+            mappings = json.load(f)
+        parties = []
 
-    def get_recap_docket(court, docket_entries):
+        # determine whether any lawyer role info has been erroneously copied between occurrences in the header (a known Recap issue)
+        all_lawyer_names = []
+        potentially_broken_names = []
+        for lawyer in [x for rparty in rparties for x in rparty['attorneys']]:
+            if lawyer['name'] in all_lawyer_names:
+                roles_raw = [x['role_raw'] for x in lawyer['roles']]
+                if len(set(roles_raw))>1: # if there's just one possible value for the text field, then it doesn't matter if it was copied
+                    potentially_broken_names.append(lawyer['name']) # otherwise, flag this lawyer
+            else:
+                all_lawyer_names.append(lawyer['name'])
+
+        for rparty in rparties:
+            # determine whether parties with the same name have been erroneously copied from other cases (a known Recap issue)
+            party_types = rparty['party_types']
+            ei, td, no_italics = parse_extra_info(rparty['extra_info'], from_recap=True) # this is Recap, so no_italics won't be used
+            recap_party_error = False
+            if party_types and len(party_types)>1:
+                potentially_broken_keys = ['extra_info', 'date_terminated', 'name', 'criminal_counts', 'criminal_complaints',
+                                            'highest_offense_level_opening', 'highest_offense_level_terminated']
+                potentially_broken_dict = {'extra_info':ei, 'date_terminated':td}
+                potentially_broken_dict.update({k:party_types[0][k] for k in potentially_broken_keys[2:]})
+                for pt in party_types:
+                    for k in potentially_broken_keys:
+                        if pt[k] != potentially_broken_dict[k]:
+                            recap_party_error = True
+                    if recap_party_error:
+                        break
+
+            # make the preliminary party dict
+            new_party = {
+                'name': rparty['name'] or None,
+                'terminating_date': td if not recap_party_error else None,
+                'extra_info': ei if not recap_party_error else None,
+                'recap_party_error': recap_party_error # affects extra_info, date_terminated, role/party_type, and the 5 non-null crim fields
+            }
+
+            # role & party_type
+            if not recap_party_error:
+                rtitle = party_types[0]['name']
+                if rtitle not in mappings.keys():
+                    party_title = rtitle
+                    party_type = 'misc'
+                else:
+                    party_title = mappings[rtitle]['title']
+                    party_type = mappings[rtitle]['type']
+            else:
+                party_title, party_type = [None]*2
+            new_party['role'] = party_title
+            new_party['party_type'] = party_type
+
+            # basic counsel fields
+            is_pro_se = 'PRO SE' in str(rparty['attorneys'])
+            extra_pro_se_info = None
+            lawyer_list = []
+            for lawyer in rparty['attorneys']:
+                lawyer_name = lawyer['name'] or None
+                contact_raw = lawyer['contact_raw'] or None
+                recap_counsel_error = True if lawyer_name in potentially_broken_names else False
+
+                # lawyer-block fields
+                if contact_raw:
+                    info_lines = [x for x in [lawyer_line_cleaner(y) for y in contact_raw.split('\n')] if x and 'PRO SE' not in x]
+                    office, address, phone, fax, email = parse_lawyer_lines(info_lines)
+                    if office and is_pro_se and lawyer_name==rparty['name']:
+                        extra_pro_se_info = office
+                        office = None
+                else:
+                    office, address, phone, fax, email = [None]*5
+
+                designation, bar_status, trial_bar_status, tdate = [None]*4
+                is_lead, is_pro_hac, is_notice, see_above = [False]*4
+                # trial bar status appears in the contact info, so it's not subject to the counsel errors (although it only appears in ILND)
+                if contact_raw and any(x in contact_raw for x in ['Trial Bar Status', 'Trial bar Status']):
+                    trial_bar_status = re.search('tatus: ([A-Za-z \'\-]{1,100})', contact_raw).group(1)
+
+                if not recap_counsel_error:
+                    full_lawyer_string = str(lawyer)
+                    # easy non-lawyer-block fields
+                    is_lead = 'LEAD ATTORNEY' in full_lawyer_string
+                    is_notice = 'ATTORNEY TO BE NOTICED' in full_lawyer_string
+                    is_pro_hac = 'PRO HAC VICE' in full_lawyer_string
+                    see_above = 'above for address' in full_lawyer_string
+
+                    # slightly trickier fields (pretty sure designation & bar status don't show up in recap, but they're included just in case)
+                    if 'Designation' in full_lawyer_string:
+                        designation = re.search('Designation: ([A-Za-z \'\-]{1,100})', full_lawyer_string).group(1)
+                    elif 'Bar Status' in full_lawyer_string:
+                        bar_status = re.search('tatus: ([A-Za-z \'\-]{1,100})', full_lawyer_string).group(1)
+                    # we can just take the first terminating date, since (sans counsel errors) there should only be one
+                    for role in lawyer['roles']:
+                        if 'TERMINATED' in role['role_raw']:
+                            tdate = role['role_raw'].split('TERMINATED: ')[1]
+
+                # append this particular lawyer's info
+                lawyer_list.append({
+                    'name': lawyer_name,
+                    'office_name': office,
+                    'address': address,
+                    'phone': phone,
+                    'fax': fax,
+                    'email': email,
+                    'is_lead_attorney': is_lead,
+                    'is_notice_attorney': is_notice,
+                    'is_pro_hac_vice': is_pro_hac,
+                    'see_above_for_address': see_above,
+                    'designation': designation,
+                    'bar_status': bar_status,
+                    'trial_bar_status': trial_bar_status,
+                    'counsel_terminating_date': tdate,
+                    'raw_info': contact_raw,
+                    'recap_counsel_error': recap_counsel_error
+                })
+            # now add some info for the party as a whole
+            new_party['counsel'] = lawyer_list
+            new_party['is_pro_se'] = is_pro_se
+            new_party['pro_se_source'] = 'explicit' if is_pro_se else None
+            new_party['extra_pro_se_info'] = extra_pro_se_info
+            new_party['pacer_id'] = None
+
+            ### this code is deprecated, as Recap crim cases are too problematic! (individual-defendant cases, no per-defendant judge fields...)
+            # if is_cr:
+            #     # Recap doesn't capture per-defendant fields
+            #     new_party['judge'] = None
+            #     new_party['referred_judges'] = None
+            #     new_party['appeals_case_ids'] = None
+
+            #     if not recap_party_error and party_type == 'defendant':
+            #         # non-count fields first (n.b.: Pacer complaints are only one line, so n-1 of the Recap complaints lines are likely junk)
+            #         complaints = party_types[0]['criminal_complaints']
+            #         new_party['complaints'] = '\n'.join([cc['name'] for cc in complaints]) if complaints else None
+            #         new_party['highest_offense_level_opening'] = party_types[0]['highest_offense_level_opening'] or None
+            #         new_party['highest_offense_level_terminated'] = party_types[0]['highest_offense_level_terminated'] or None
+
+            #         # then criminal counts
+            #         pending, terminated = [], []
+            #         for cc in party_types[0]['criminal_counts']:
+            #             if '(' in cc['name']:
+            #                 pid = cc['name'].split('(')[-1].split(')')[0]
+            #                 text = cc['name'].split('('+pid)[0]
+            #             else:
+            #                 pid = None
+            #                 text = cc['name'] or None
+            #             disp = cc['disposition'] or None
+            #             cc_parsed = {'pacer_id':pid, 'text':text, 'disposition':disp}
+            #             if not disp or 'dismissed' in disp.lower(): # pretty coarse heuristic - maybe update later
+            #                 terminated.append(cc_parsed)
+            #             else:
+            #                 pending.append(cc_parsed)
+
+            #         new_party['pending_counts'] = pending or None
+            #         new_party['terminated_counts'] = terminated or None
+            #     else:
+            #         for key in ('pending_counts', 'terminated_counts', 'complaints', 'highest_offense_level_opening', 'highest_offense_level_terminated'):
+            #             new_party[key] = None
+
+            parties.append(new_party)
+        return parties
+
+    def _get_recap_docket(court, docket_entries):
         '''
         Remap the recap docket
         Inputs:
@@ -321,7 +568,7 @@ def remap_recap_data(recap_fpath=None, rjdata=None):
             - list of docket entries same as parsed format
         '''
 
-        def get_doc_links(row):
+        def _get_doc_links(row):
             ''' Get links to documents (most rows don't have attachments, some do)'''
             documents = {}
             for doc in row.get('recap_documents', []):
@@ -343,134 +590,86 @@ def remap_recap_data(recap_fpath=None, rjdata=None):
             return documents
 
         rows = [
-            {'date_filed': standardize_date(row['date_filed']),
-             'ind': row['entry_number'],
+            {'date_filed': _standardize_date(row['date_filed']),
+             'ind': str(row['entry_number'] or ''),
              'docket_text': row['description'],
-             'documents': get_doc_links(row),
-             'edges': None
+             'documents': _get_doc_links(row),
+             'edges': []
             }
             for row in docket_entries
         ]
         return rows
 
-    #Load the data
+    def _standardize_date(tdate):
+        '''y-m-d to m/d/y'''
+        if not tdate:
+            return None
+        try:
+            y,m,d = tdate.split('-')
+            return '/'.join([m, d, y])
+        except AttributeError:
+            return None
+
+
+    # Load the data
     try:
         if not rjdata:
             recap_fpath = std_path(recap_fpath)
             jpath = settings.PROJECT_ROOT / recap_fpath
-            rjdata = json.load(open(jpath), encoding="utf-8")
+            rjdata = json.load(open(jpath))
     except:
         print(f"Error loading file {recap_fpath}")
         return {}
-    #Get the termination date
-    tdate = standardize_date(rjdata['date_terminated'])
+
+    # Get some general fields
+    tdate = _standardize_date(rjdata['date_terminated'])
     case_status = 'closed' if tdate else 'open'
+    judge = rjdata['assigned_to_str'] if rjdata['assigned_to_str'] and rjdata['assigned_to_str']!='Unassigned' else None
 
-    # parties/counts
-    case_type = rjdata['docket_number'].split('-')[1]
-    is_cr = bool(case_type == 'cr')
-    parties = {'plaintiff':{}, 'defendant':{}, 'bk_party':{}, 'other_party':{}, 'misc':{}}
-    pending_counts, terminated_counts, complaints = ({},{},{}) if is_cr else (None,None,None)
-
-    for party in rjdata['parties']:
-        name = party['name']
-        extra_info, terminating_date = parse_extra_info(party['extra_info'], from_recap=True)
-
-        # lawyer dictionary
-        lawyer_dict = {}
-        is_pro_se = 'PRO SE' in str(party)
-        if not is_pro_se and 'attorneys' in party.keys():
-            for lawyer in party['attorneys']:
-                is_lead = 'LEAD ATTORNEY' in str(lawyer)
-                is_pro_hac = 'PRO HAC VICE' in str(lawyer)
-                info = lawyer['contact_raw']
-                office = info.split('\n')[0]
-                addtl_info = {}
-                if 'Designation' in info:
-                    addtl_info['designation'] = re.search('Designation: ([A-Za-z \'\-]{1,100})', info).group(1)
-                if any(x in info for x in ['Trial Bar Status', 'Trial bar Status']): # this seems to appear only in ILND
-                    addtl_info['trial_bar_status'] = re.search('tatus: ([A-Za-z \'\-]{1,100})', info).group(1)
-                elif 'Bar Status' in info:
-                    addtl_info['bar_status'] = re.search('tatus: ([A-Za-z \'\-]{1,100})', info).group(1)
-                lawyer_dict[lawyer['name']] = {'office':office,'is_lead_attorney':is_lead,'is_pro_hac_vice':is_pro_hac,'additional_info':addtl_info}
-
-        # role titles, terminating date, extra info
-        with open(settings.ROLE_MAPPINGS, 'r') as f:
-            mappings = json.load(f)
-        for pt in party['party_types']:
-            role = pt['name']
-
-            # sometimes these fields vary from party name to party name
-            local_extra_info, local_terminating_date = parse_extra_info(pt['extra_info'], from_recap=True)
-            extra_info = extra_info+local_extra_info if extra_info and local_extra_info and (
-                local_extra_info[0] not in extra_info) else local_extra_info or extra_info
-            date_delta = difference_in_dates(local_terminating_date, terminating_date)
-            terminating_date = local_terminating_date if date_delta and date_delta>0 else local_terminating_date
-
-            if role not in mappings.keys():
-                party_title = role
-                party_type = 'misc'
-            else:
-                party_title = mappings[role]['title']
-                party_type = mappings[role]['type']
-            dicti = {name: {'roles':[party_title], 'counsel':(lawyer_dict or None), 'is_pro_se':is_pro_se, 'terminating_date':terminating_date, 'extra_info':extra_info}}
-            parties[party_type] = update_party(parties[party_type], name, dicti)
-
-        # criminal counts
-        if is_cr:
-            criminal_counts = [count for pt in party['party_types'] for count in pt['criminal_counts']]
-            pending, terminated = [], []
-            for cc in criminal_counts:
-                cc_parsed = [cc['name'], cc['disposition']]
-                if 'dismissed' in cc['disposition'].lower(): # pretty coarse heuristic, maybe update later
-                    terminated.append(cc_parsed)
-                else:
-                    pending.append(cc_parsed)
-            if len(pending) > 0:
-                pending_counts[name] = pending
-            if len(terminated) > 0:
-                terminated_counts[name] = terminated
-
-    # Convert the data
-    fdata = {
-        'bankruptcy_parties':parties['bk_party'],
-        'case_flags': '',
-        'case_id': ftools.clean_case_id(rjdata['docket_number']),
-        'case_name': rjdata['case_name'],
-        'case_status': case_status,
-        'case_type': case_type,
-        'cause': rjdata['cause'],
-        'complaints': complaints,
-        'defendants': parties['defendant'],
-        'docket': get_recap_docket(rjdata['court'], rjdata['docket_entries']) ,
-        'download_court': rjdata['court'],
-        'filing_date': standardize_date(rjdata['date_filed']),
-        'header_case_id':None,
-        'judge': rjdata['assigned_to_str'],
-        'jurisdiction': rjdata['jurisdiction_type'],
-        'jury_demand': rjdata['jury_demand'],
-        'lead_case_id':None,
-        'misc_participants':parties['misc'],
-        'monetary_demand':None,
-        'nature_suit': rjdata['nature_of_suit'],
-        'other_court':None,
-        'other_parties':parties['other_party'],
-        'pacer_case_id':rjdata['pacer_case_id'],
-        'pending_counts':pending_counts,
-        'plaintiffs': parties['plaintiff'],
-        'referred_judge': rjdata['referred_to_str'],
-        'terminated_counts':terminated_counts,
-        'terminating_date': tdate,
-        'source':'recap',
-        'ucid': ucid(rjdata['court'], ftools.clean_case_id(rjdata['docket_number'])),
-        # MDL/Multi keys
-        **{k:None for k in ['mdl_code', 'mdl_id_source','is_mdl', 'is_multi']},
-        # Billing keys
-        **{k:None for k in ['billable_pages', 'cost','n_docket_reports',]},
-        # Scraper things
-        **{k:None for k in ['download_timestamp', 'download_url', 'docket_available', 'member_case_key']}
-    }
-    return fdata
+    case_type = rjdata['docket_number'].split('-')[1] if rjdata['docket_number'] else None
+    if case_type == 'cv':
+        # Convert the data
+        fdata = {
+            'appeals_case_ids': [],
+            'case_flags': [],
+            'case_id': ftools.clean_case_id(rjdata['docket_number']),
+            'case_name': rjdata['case_name'] or None,
+            'case_pacer_id': None,
+            'case_status': case_status,
+            'case_type': case_type,
+            'cause': rjdata['cause'] or None,
+            'court': rjdata['court'] or None,
+            'docket': _get_recap_docket(rjdata['court'], rjdata['docket_entries']),
+            'filed_in_error_text': None,
+            'filing_date': _standardize_date(rjdata['date_filed']),
+            'header_case_id': None,
+            'judge': judge, # n.b.: might contain junk on the end (e.g. 'Referred')
+            'jurisdiction': rjdata['jurisdiction_type'] or None,
+            'jury_demand': rjdata['jury_demand'] or None,
+            'lead_case_pacer_id': None,
+            'lead_case_id': None,
+            'magistrate_case_ids': [],
+            'monetary_demand': None,
+            'nature_suit': dei.nos_matcher(rjdata['nature_of_suit'], short_hand=True) or rjdata['nature_of_suit'],
+            'other_courts': [],
+            'parties': _get_recap_parties(rjdata['parties']),
+            'recap_id': rjdata['id'] or None,
+            'referred_judges': [rjdata['referred_to_str']] if rjdata['referred_to_str'] else [],
+            'related_cases': [],
+            'terminating_date': tdate,
+            'source': 'recap',
+            'summary': {},
+            'ucid': ucid(rjdata['court'], ftools.clean_case_id(rjdata['docket_number'])),
+            # MDL/Multi keys
+            **{k:None for k in ['mdl_code', 'mdl_id_source', 'is_mdl', 'is_multi']},
+            # Billing keys
+            **{k:None for k in ['billable_pages', 'cost', 'n_docket_reports']},
+            # Scraper things
+            **{k:None for k in ['download_timestamp', 'download_url', 'docket_available', 'member_case_key', 'stub']}
+        }
+        return fdata
+    else:
+        return None # throw out criminal cases as well as mj, mc, and the miscellaneous other low-frequency types
 
 
 
@@ -720,18 +919,26 @@ def get_case_counts(gb_cols=[], qstring=None):
     df = load_unique_files_df().query(qstring) if qstring else load_unique_files_df()
     return df.groupby(['year', 'court', *gb_cols], dropna=False).size().reset_index(name='case_count')
 
-def load_case(fpath, html=False, recap_orig=False):
+def load_case(fpath=None, html=False, recap_orig=False, ucid=None, skip_scrubbing=False):
     '''
     Loads the case given its filepath
 
     input:
-        fpath (string/Path): a path relative to the project roots
+        fpath (str or Path): a path relative to the project roots
         html (bool): whether to return the html (only works for Pacer, not Recap)
         recap_orig (bool): whether to return the original recap file, rather than the mapped
+        ucid (str): the ucid of the case to load
 
     output:
         the json of the case (or html if html is True)
     '''
+    if not (fpath or ucid):
+        raise ValueError("Must provide a ucid or fpath")
+
+    elif ucid and not fpath:
+        ext = 'html' if html else 'json'
+        fpath = ftools.get_expected_path(ucid, ext=ext)
+
     # Standardise across Windows/OSX and make it a Path object
     fpath = std_path(fpath)
 
@@ -745,18 +952,32 @@ def load_case(fpath, html=False, recap_orig=False):
     if html:
         hpath = get_pacer_html(jpath)
         if hpath:
-            return str( open(settings.PROJECT_ROOT / hpath, 'rb').read() )
+            try:
+                html_text = str( open(settings.PROJECT_ROOT / hpath, 'r', encoding='utf-8').read() )
+            except:
+                html_text = str( open(settings.PROJECT_ROOT / hpath, 'r', encoding='windows-1252').read() )
+            return html_text if skip_scrubbing else remove_sensitive_info(html_text)
         else:
             raise FileNotFoundError('HTML file not found')
     else:
-        jdata = json.load( open(jpath, encoding="utf-8") )
+        if skip_scrubbing:
+            jdata = json.load(open(jpath, encoding="utf-8"))
+        else:
+            json_text = open(jpath, encoding="utf-8").read()
+            jdata = json.loads(remove_sensitive_info(json_text))
         jdata['case_id'] = ftools.clean_case_id(jdata['case_id'])
 
-        # TODO: recap orig- include recap orig
-        # if recap_orig:
-        #     if 'recap' in jdata['source']:
-        #         # recap_id = #This needs to be in case json
-        #         return json.load(open(settings.RECAP_PATH/f"{recap_id}.json", encoding="utf-8"))
+        if recap_orig:
+            if 'recap' in jdata['source']:
+                try:
+                    recap_id = jdata['recap_id']
+                    if skip_scrubbing:
+                        return json.load(open(settings.RECAP_PATH/f"{recap_id}.json", encoding="utf-8"))
+                    else:
+                        json_text = open(settings.RECAP_PATH/f"{recap_id}.json", encoding="utf-8").read()
+                        return json.loads(remove_sensitive_info(json_text))
+                except:
+                    print('Cannot load recap original, returning parsed json instead')
 
         return jdata
 
@@ -788,28 +1009,31 @@ def difference_in_dates(date_x, date_0):
         return None
 
 # Generate unique case id
-def ucid(court, case_id, clean=False):
+def ucid(court, case_id, clean=False, allow_def_stub=True):
     '''
-    Generate a unique case id (ucid)
+    Generate a unique case id (ucid), or a series of ucids
 
     Inputs:
         - court (str or Series): court abbreviation
         - case_id (str or Series): either colon or hyphen format, will be standardised
         - clean (bool): whether the case_id is already clean (speeds up calculation)
+        - allow_def_stub (bool): whether or not to allow defendant docket stubs
     Output:
         (str or Series) like 'nced;;5:16-cv-00843'
     '''
     if type(case_id)==pd.Series:
         if not clean:
-            return court + ';;' + case_id.map(ftools.clean_case_id)
+            return court + ';;' + case_id.map(lambda x: ftools.clean_case_id(x, allow_def_stub))
         else:
             return court + ';;' + case_id
     else:
         if not clean:
-            return f"{court};;{ftools.clean_case_id(case_id)}"
+            clean_case_id = ftools.clean_case_id(case_id, allow_def_stub)
+            return f"{court};;{clean_case_id}"
         else:
             return f"{court};;{case_id}"
 
+# Alias
 get_ucid = ucid
 
 def ucid_from_scratch(court, office, year, case_type, case_no):
@@ -882,7 +1106,7 @@ def is_recap(fpath):
     '''Determine if a case is a recap case based on the filepath'''
     return 'recap' in std_path(fpath).parts
 
-def group_dockets(docket_fpaths, court=None, use_ucids=None, summary_fpaths=None):
+def group_dockets(docket_fpaths, court=None, use_ucids=None, summary_fpaths=None, recap_df=None):
     '''
     Group filepaths to docket htmls by ucid (will be multiple for docket updates)
 
@@ -892,6 +1116,7 @@ def group_dockets(docket_fpaths, court=None, use_ucids=None, summary_fpaths=None
         - use_ucids (list-like): a list of ucids to include. If supplied, will filter out
             any ucids that are not in this list from the output
         - summary_fpaths (list): list of str or Path objects of summary fpaths to connect to docket_fpaths
+        - recap_df (pd.DataFrame): a dataframe with columns: 'ucid' and 'fpath' (relative to project root)
     Outputs:
         - a list of dicts grouped by ucid with
             - 'docket_paths': tuples of paths
@@ -913,6 +1138,25 @@ def group_dockets(docket_fpaths, court=None, use_ucids=None, summary_fpaths=None
     # Filter which ones to use
     df['use'] = True if type(use_ucids) is type(None) else df.ucid.isin(use_ucids)
 
+    # Collapse down to ucids we want to use
+    df = df[df.use].copy()
+    del df['use']
+
+    if recap_df is not None:
+
+        # Filter by court if court column present
+        if 'court' in recap_df.columns:
+            recap_df = recap_df[recap_df.court.eq(court)].copy()
+
+        # Reduce down to just ucid and fpath columns
+        recap_df = recap_df[['ucid', 'fpath']].copy()
+        recap_df.fpath = recap_df.fpath.apply(lambda x: settings.PROJECT_ROOT/x)
+
+        # Collapse down to only use RECAP cases/ucids that overlap with current selection
+        recap_df = recap_df[recap_df.ucid.isin(df.ucid)]
+        # Append to the main df
+        df = df.append(recap_df)
+
     df['summary_fpath'] = pd.Series(dtype=str)
 
     if summary_fpaths:
@@ -925,8 +1169,10 @@ def group_dockets(docket_fpaths, court=None, use_ucids=None, summary_fpaths=None
         summary_map = df_summaries.set_index('ucid')['fpath']
         df['summary_path'] = df.ucid.map(summary_map)
 
-    # cases = df[df.use].groupby('ucid')['fpath'].apply(tuple).to_list()
-    cases = df[df.use].groupby('ucid').agg(docket_paths=('fpath',tuple), summary_path=('summary_path','first')).to_dict('records')
+        cases = df.groupby('ucid').agg(docket_paths=('fpath',tuple), summary_path=('summary_path','first')).to_dict('records')
+    else:
+        cases = df.groupby('ucid').agg(docket_paths=('fpath',tuple) ).to_dict('records')
+
     return cases
 
 # n.b.: compress_data and decompress_data may no longer be needed after updates to parse_pacer.py (11/2/20)
@@ -1021,3 +1267,265 @@ def case_link(ucids, ext='html' , incl_token=False, server_index=-1):
 
         link = f'{ucid}: <a target="_blank" href="{full_url}">{full_url}</a>'
         display(HTML(link))
+
+def gen_recap_id_file(file=None):
+    ''' Generate the recap id table, using file as the basis (if it already exists) '''
+
+    ###
+    # Helpers
+    ###
+    def _get_id_ucid():
+        ''' Get the (recap_id, ucid) pairs '''
+        for fpath in settings.RECAP_PATH.glob('*.json'):
+            jdata = json.load(open(fpath))
+            recap_id = fpath.stem
+            ucid = ucid(jdata['court'], jdata['docket_number'])
+            yield (recap_id, ucid)
+
+    def attempt_case_type(ucid):
+        try:
+            case_no = parse_ucid(ucid)['case_no']
+            case_type = ftools.decompose_caseno(case_no)['case_type']
+        except:
+            case_type = None
+
+        return case_type
+
+
+
+    # Read file or generate if not supplied
+    if file:
+        df = pd.read_csv(file)
+        df = df[['recap_id', 'ucid']].copy()
+    else:
+        df = pd.DataFrame( _get_id_ucid(), columns=('recap_id', 'ucid'))
+
+    # Case Type
+    df['case_type'] = df.ucid.map(attempt_case_type)
+
+    # Buckets
+    df['bucket'] = ''
+
+    # Have html
+    dff = load_unique_files_df()
+    df['ignore_have_html'] = df.ucid.isin(dff[dff.has_html].index)
+
+    # Non cv
+    df['ignore_non_cv'] = ~df.case_type.eq('cv')
+
+    # The rest
+    df['use'] = ~(df.ignore_have_html | df.ignore_non_cv)
+
+    return df
+
+def jload_n_hash(jpath):
+    ''' Load a json file with a '_hash' key that is a python hash (int) of the file string '''
+
+    jstring = open(jpath).read()
+    _hash = hash(jstring)
+    jdata = json.loads(jstring)
+    jdata['_hash'] = _hash
+    return jdata
+
+def get_latest_docket_date(ucid):
+    '''
+    Get the filed date of latest docket entry for a single case
+    Inputs:
+        - ucid (str): case ucid
+    Output:
+        latest_date (str) - returns None if no dates found in docket or case doesn't exist
+    '''
+    jpath = ftools.get_expected_path(ucid=ucid)
+
+    # If no json file then leave blank (will get all docket lines)
+    if not jpath.exists():
+        return None
+
+    # Load case data and get all dates
+    jdata = load_case(ucid=ucid)
+    docket_dates = [x['date_filed'] for x in ( jdata.get('docket') or [] ) ]
+    if not len(docket_dates):
+        return None
+    else:
+        latest_date = pd.to_datetime(docket_dates).max().strftime(ftools.FMT_PACERDATE)
+        return latest_date
+
+
+def insert_extra_docketlines(base, extra, threshold_date=0.8, default='before'):
+
+    '''
+    Insert extra docketlines into docket data.
+    Currently only inserts at the start or end.
+    Tries to order first by looking at the docket indexes, if that is inconclusive
+    it tries to use the docket dates to place extra either before or after base.
+
+    Inputs:
+        - base (list): the baseline of case docket data, a list of dicts (follows the docket schema),
+            assumes it has been extracted correctly and is ordered corrrectly
+        - extra (list): the additional docket lines to add, follows the docket schema,
+            assumes this is a single block of docket lines to add
+        - threshold_date (float): score between 0 and 1, the required threshold to decide
+            before or after based on the docket entry dates
+        - default ('after', 'before'): the default outcome if inconclusive
+    Output
+        (list of dict): consolidated list of docket entry data
+    '''
+    def get_ind_int(ind_str):
+        try:
+            return int(ind_str)
+        except:
+            return None
+
+    # If either list is empty, then answer is trivial
+    if not len(base) or not len(extra):
+        result = {'extra_placement': default, 'basis':'empty_list'}
+
+    else:
+
+        # Compare using filing dates
+        base_dates = [datetime.strptime(x['date_filed'], ftools.FMT_PACERDATE) for x in base]
+        extra_dates = [datetime.strptime(x['date_filed'], ftools.FMT_PACERDATE) for x in extra]
+
+        n_dates = len(extra_dates)
+        base_date_min = min(base_dates)
+        base_date_max = max(base_dates)
+
+        pct_date_before = sum(x<= base_date_min for x in extra_dates) / n_dates
+        pct_date_after = sum(x>= base_date_max for x in extra_dates) / n_dates
+
+        if (pct_date_before > pct_date_after) and (pct_date_before >= threshold_date):
+            result = {'extra_placement': 'before', 'basis':'date'}
+
+        elif (pct_date_after > pct_date_before) and (pct_date_after >= threshold_date):
+            result = {'extra_placement': 'after', 'basis':'date'}
+
+        else:
+
+            # Use the ind to compare
+            base_ind = [get_ind_int(x['ind']) for x in base]
+            base_ind = list( filter(None, base_ind) )
+            extra_ind = [get_ind_int(x['ind']) for x in extra]
+            extra_ind = list( filter(None, extra_ind) )
+            n_ind = len(extra_ind)
+
+            if n_ind and len(base_ind):
+
+                base_ind_min = min(base_ind)
+                base_ind_max = max(base_ind)
+
+                pct_ind_before = sum(x<= base_ind_min for x in extra_ind) / n_ind
+                pct_ind_after = sum(x>= base_ind_max for x in extra_ind) / n_ind
+
+                if pct_ind_before > pct_ind_after:
+                    result = {'extra_placement': 'before', 'basis':'ind'}
+                else:
+                    result = {'extra_placement': 'after', 'basis':'ind'}
+
+            else:
+                # Cannot make deicision
+                result = {'extra_placement': default, 'basis':'default'}
+
+    # Now make the placement
+    if result['extra_placement'] == 'before':
+        return extra+base
+    elif result['extra_placement'] == 'after':
+        return base+extra
+
+
+
+def load_sentencing_commission(year_a = 2008, year_b = 2019, small = False, var_cols = []):
+
+    if small:
+        return pd.read_json(settings.SENTENCING_COMMISSION/"ussc_2008-2019_smallform.json")
+
+    # import lzma
+
+    eligible_years = list(range(2008,2020))
+    csv_files = [(f"opafy{str(i)[-2:].zfill(2)}nid.csv", int(i)) for i in eligible_years]
+
+    if year_a not in eligible_years or year_b not in eligible_years:
+        return f"Issue Detected: limit load to one of {eligible_years}"
+    else:
+        csv_files = [k for k in csv_files if k[1]>=year_a and k[1]<= year_b]
+
+    if not var_cols:
+        ## STAN_M --> N = statute, M = count
+        ## STA2_1 --> THE SECOND statute, of THE FIRST count
+        statutes = []
+        for i in range(1,26):
+            statutes.append(f"STA1_{i}")
+            statutes.append(f"NWSTAT{i}")
+            statutes.append(f"STA2_{i}")
+        var_cols =  [
+            'POOFFICE','CIRCDIST','DISTRICT', 'MONCIRC',
+            'DISPOSIT','USSCIDN', 'DOBMON','DOBYR','AGE', 'MONSEX',
+            'NEWCNVTN','SOURCES', 'OFFGUIDE','OFFTYP2','OFFTYPSB','CASETYPE',
+            'QUARTER','SENTMON','SENTYR',
+            'SENTTOT', 'SENTTOT0','SENTIMP','NOCOUNTS','YEARS', 'AMTREST','TOTREST','AMTFINEC',
+            *statutes]
+
+    yrs = {}
+
+    print(f"Loading Sentencing Commission Data: {year_a} - {year_b}")
+    for file_pair in csv_files:
+        # grabbing each years headers, as columns may be out of order year over year
+        load_path = settings.SENTENCING_COMMISSION / file_pair[0]
+        if load_path.suffix ==".csv":
+            with open(load_path) as file:
+                content = file.readline()
+        # elif load_path.suffix == '.xz':
+            # with lzma.open(load_path, mode='rt') as file:
+                # content = file.readline()
+
+        # use the column titles to determine index columns to load using pandas
+        header = content.split(',')
+        grabber = [header.index(i) for i in var_cols if i in header]
+        if len(grabber) == 0:
+            alt_cols = [col.lower() for col in var_cols]
+            grabber = [header.index(i) for i in alt_cols if i in header]
+            # print("Lowercased solved:", len(grabber))
+        this_year = []
+        for chunk in pd.read_csv(load_path, usecols=grabber, chunksize=10000, low_memory=False):
+            this_year.append(chunk)
+
+        yrs[file_pair[1]] = pd.concat(this_year)
+
+        print(f"{file_pair[1]} completed.")
+
+    mydfs = []
+    for yr, df in yrs.items():
+        df['year_file'] = yr
+        df.columns = [col.upper() for col in df.columns]
+        mydfs.append(df)
+
+    fulldf = pd.concat(mydfs)
+
+    district_walk = pd.read_csv(settings.SENTENCING_COMMISSION / 'ussc_district_metadata.csv')
+
+    CD_lookup = {c:a for c,a in district_walk[['CIRCDIST','Abbr']].to_numpy()}
+    fulldf['distr_abbrev'] = fulldf.CIRCDIST.map(CD_lookup)
+
+    fulldf.set_index(pd.Series(range(len(fulldf))), inplace=True)
+
+    unistats = fulldf[[col for col in fulldf.columns if 'NWSTAT' in col]].copy()
+    unistats.fillna(-1, inplace=True)
+
+    next_rows = []
+    for index, row in tqdm.tqdm(unistats.iterrows(), total=len(unistats)):
+        next_rows.append({'join_index':index, 'unique_statutes':set(v for k,v in row.items() if v!=-1)})
+
+    unique_statutes = pd.DataFrame(next_rows)
+
+    settify_unique = fulldf.merge(unique_statutes, how='left', left_index=True, right_on = 'join_index')
+    settify_unique.drop([col for col in settify_unique.columns if "NWSTAT" in col]+['join_index'],axis=1, inplace=True)
+
+    settify_unique.to_json(SENTENCING_COMMISSION/"ussc_2008-2019_smallform.json")
+
+    return settify_unique
+def run_in_executor(f):
+    '''Decorator to run function as blocking'''
+    @functools.wraps(f)
+    def inner(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return loop.run_in_executor(None, lambda: f(*args, **kwargs))
+    return inner

@@ -2,13 +2,14 @@ import pandas as pd
 import numpy as np
 from scipy import stats
 import datetime
-
+import json
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from support import settings
 from support import court_functions as cf
 from support import data_tools as dtools
+from support import fhandle_tools as ftools
 
 DF_SEL, DF_JEL = None, None
 NAN_NAMES = {'not_found': 'XXNaNXX', 'committee': 'XXNon-IndividualXX'}
@@ -69,11 +70,39 @@ def get_jel():
     global DF_JEL
     if type(DF_JEL) == type(None):
         print("Reading in JEL...")
-        DF_JEL = pd.read_csv(settings.DF_JEL)
+        DF_JEL = pd.read_json(settings.JEL_JSONL, lines=True)
+        DF_JEL.loc[~DF_JEL.NID.isna(), "NID"] = DF_JEL.NID.apply(lambda x: str(x).split('.')[0])
         print("...Complete")
     return DF_JEL
 
 
+def load_SEL(ucid = None):
+    if not ucid:
+        print("Please specify the ucid or list of ucids to load")
+
+    if type(ucid) != list:
+        ucid = [ucid]
+
+    SEL_rows = []
+    for each in ucid:
+        # create filepath
+        fname = ftools.build_sel_filename_from_ucid(each)
+        # load file
+        results = []
+        if fname.exists():
+            with open(fname, 'r') as json_file:
+                json_list = list(json_file)
+                for json_str in json_list:
+                    results.append(json.loads(json_str))
+
+        SEL_rows+=results
+    
+    # return dataframe
+    if SEL_rows:
+        SEL = pd.DataFrame(SEL_rows)
+        return SEL
+    else:
+        return "No data found"
 
 ######################################################
 ### Judge ID functions for build_judge_ifp_data.py ###

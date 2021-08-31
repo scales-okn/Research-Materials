@@ -60,7 +60,7 @@ def bundler(indf, name, notes=None, overwrite=False, anno_col=None):
         else:
             raise ValueError(f'The directory {str(bundle_dir)} already exists')
     else:
-        bundle_dir.mkdir()
+        bundle_dir.mkdir(parents=True)
 
     # Start building html index page with strings
     heading = f"<h1 class='heading'>Data Dump: {name}</h1>"
@@ -140,7 +140,7 @@ def build_new_td(json_text, row_annotations, soup=None, inner_html=False):
     og_pointer = 0
 
     # Sort annotation by 'start'
-    sorted(row_annotations, key=lambda x: x['start'])
+    row_annotations.sort(key=lambda x: x['start'])
 
     # Iterate through each annotation and 'swap out' original text for new span
     for annot in row_annotations:
