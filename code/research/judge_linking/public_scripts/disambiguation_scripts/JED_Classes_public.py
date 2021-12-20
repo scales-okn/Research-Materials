@@ -2,6 +2,7 @@
 import JED_Utilities_public as JU
 import JED_Helpers_public as JH
 import JED_Globals_public as JG
+import pandas as pd
 
 class IntraMatch(object):
     """Parent class used for disambiguation. The class represents an entity string with meta-information related to it
@@ -9,15 +10,20 @@ class IntraMatch(object):
     Args:
         object (obj): Python object representation to be used in disambiguation node pools
     """
-    def __init__(self,  cleaned_name, n_ucids):
+    def __init__(self,  cleaned_name: str, n_ucids: int, additional_reprs: list = None, SID: int = 0):
         """Initialize the object
 
         Args:
-            cleaned_name (str): entity string to be used in disambiguation
+            cleaned_name (list): list of base entity strings to be used in disambiguation
             n_ucids (int): number of unique ucids per grouping factor (in a court, or overall) that the entity appears on
+            additional_reprs (list, optional): additional known vairations the name takes. Defaults to None.
+            SID (int, optional): Unique identifier. Defaults to 0.
         """
         # grab the logging function in the global space, should be instantiated by the main function
         self.log = JU.log_message #logging.getLogger()
+
+        # unique object identifier
+        self.serial_id = SID
 
         # cleaned name string
         self.name = cleaned_name
@@ -28,6 +34,13 @@ class IntraMatch(object):
         self.base_tokens = cleaned_name.split()
         # specialty function that builds initialed forms of the name (i.e. John Robert Smith --> J R Smith, John R Smith, J Robert Smith)
         self.inferred_tokens = JH.build_inferred_tokens(self.base_tokens)
+        if additional_reprs:
+            for additional in additional_reprs:
+                ADDS = JH.build_inferred_tokens(additional.split())
+                for fi in [True, False]:
+                    for mi in [True, False]:
+                        extras = [a for a in ADDS[fi][mi] if a not in self.inferred_tokens[fi][mi]]
+                        self.inferred_tokens[fi][mi] += extras
 
         # init blank dicts for nicknames and universal spellings
         self.nicknames_tokens =  {True:{}, False:{}}
@@ -40,7 +53,10 @@ class IntraMatch(object):
         # all nodes start as eligible to be mapped to, pointing to themselevs, and have no children
         self.eligible = True
         self.POINTS_TO = '>>SELF<<'
+        self.POINTS_TO_SID = self.serial_id
         self.children = []
+        self.Possible_Pointers = []
+        self.is_ambiguous = False
 
         # helpful attribute constantly checked
         self.token_length = len(self.base_tokens)
@@ -51,20 +67,23 @@ class IntraMatch(object):
             self.suffix = self.base_tokens[-1]
             if self.token_length==1:
                 self.anchor = None
+                self.init_init_sur_suff = f'{self.suffix}'
             else:
                 self.anchor = self.base_tokens[-2]
+                self.init_init_sur_suff = f'{" ".join(tok[0] for tok in self.base_tokens[0:-2])} {self.anchor} {self.suffix}'
             self.initials_wo_suff = [tok[0] for tok in self.base_tokens[0:-1]]
             self.tokens_wo_suff = [tok for tok in self.base_tokens[0:-1]]
         else:
             self.suffix=None
             self.anchor = self.base_tokens[-1]
+            self.init_init_sur_suff = f'{" ".join(tok[0] for tok in self.base_tokens[0:-1])} {self.anchor}'
             self.initials_wo_suff = [tok[0] for tok in self.base_tokens]
             self.tokens_wo_suff = self.base_tokens
         
-        
+
         self.initials_w_suff = [tok[0] for tok in self.base_tokens]
 
-    def adopt_children(self, other, method, where):
+    def adopt_children(self, other, method: str, where: str):
         """method used to assign another entity node to this node as the parent entity
 
         Args:
@@ -74,7 +93,7 @@ class IntraMatch(object):
         """
 
         # log the disambiguation
-        self.log(f"{where:25} | {method:22} |{other.name:25} --> {self.name:25}")#.info(f"{where:25} | {method:22} |{other.name:25} --> {self.name:25}")
+        self.log(f"{where:25} | {method:22} |{other.name:25} --> {self.name:25}")
 
         # add the child node to a list of children
         self.children.append(other)
@@ -85,7 +104,121 @@ class IntraMatch(object):
         for each in self.children:
             each.points_to(self)
 
-    def choose_winner_ucids(self, other, method, where):
+    def assign_ambiguity(self, matches: list, method: str, where: str):
+        """given a list of matches that remain ambiguous, map the entity to them as such
+
+        Args:
+            matches (list): other nodes
+            method (str): description of the matching method that led to this ambiguous result
+            where (str): where in the pipeline it occurred
+        """
+        # log each match
+        for M in matches:
+            self.log(f"{where:25} | {method:22} |{self.name:25} --> {M.name:25} (Ambiguous)")
+
+        # update this objects "ambiguous possibilities" list
+        self.Possible_Pointers+= matches
+        # track that this node could not be disambiguated entirely
+        self.is_ambiguous = True
+        # disqualify node from further matching
+        self.eligible = False
+
+        # any child nodes that previously pointed here receive the same update
+        for child in self.children:
+            child.Possible_Pointers+= matches
+            child.is_ambiguous = True
+            child.eligible=False
+
+        return
+
+    def assess_ambiguity(self, possible_matches: list, method: str, where: str):
+        """determine if the possible matches identified are fully disambiguable with this entity or if 
+        ambiguity remains
+
+        Args:
+            possible_matches (list): list of objects that could constitute a disambiguated match to this entity
+            method (str): description of the matching method that led to this ambiguous result
+            where (str): where in the pipeline it occurred
+
+        Returns:
+            bool: did the ambuity assessment succeed? (FOR DEV ONLY -- a FALSE means uncaught logic occurred)
+        """
+        # if there is a single match, thats great, choose a winner
+        if len(possible_matches) == 1:
+            self.choose_winner(possible_matches[0], method, where)
+            return True
+        # if there were multiple matches, we need to assess ambiguity criteria
+        elif len(possible_matches)>1:
+            # if just a single token self, point to others
+            # no single token name can confidently match to multi-token names (the only way they make it here is that scenrio)
+            if self.token_length == 1:
+                self.assign_ambiguity(possible_matches, method, where)
+                return True
+
+            # if only one is ground truth NID
+            elif len([p for p in possible_matches if p.is_FJC or p.has_SJID])==1:
+                winner = [p for p in possible_matches if p.is_FJC  or p.has_SJID][0]
+                losers = [p for p in possible_matches if p!=winner]
+                for loser in losers:
+                    winner.adopt_children(loser, method, where)
+                self.choose_winner(winner, method, where)
+                return True
+            # if more than one has an NID
+            if len([p for p in possible_matches if p.is_FJC or p.has_SJID])>1:
+                # ambiguous
+                ground_truths = [p for p in possible_matches if p.is_FJC or p.has_SJID]                
+                self.assign_ambiguity(ground_truths, method, where)
+                print(self.name, self.NID, "deemed ambiguous with")
+                for p in ground_truths:
+                    print("---",p.name, p.NID)
+                return True
+
+            # if only one is ground truth BA_MAG_ID
+            elif len([p for p in possible_matches if p.is_BA_MAG or p.has_SJID])==1:
+                winner = [p for p in possible_matches if p.is_BA_MAG or p.has_SJID][0]
+                losers = [p for p in possible_matches if p!=winner]
+                for loser in losers:
+                    winner.adopt_children(loser, method, where)
+                self.choose_winner(winner, method, where)
+                return True
+
+            # if more than one has a BA/MAG ID
+            if len([p for p in possible_matches if p.is_BA_MAG or p.has_SJID])>1:
+                # ambiguous
+                ground_truths = [p for p in possible_matches if p.is_BA_MAG or p.has_SJID]
+                self.assign_ambiguity(ground_truths, method, where)
+                print(self.name, self.NID, "deemed ambiguous with")
+                for p in ground_truths:
+                    print("---",p.name, p.BA_MAG_ID)
+                return True
+
+            # if none are a groundtruth
+            elif len([p for p in possible_matches if p.is_FJC or p.is_BA_MAG])==0:
+                winner=self
+                for match in possible_matches:
+                    winner.choose_winner(match, method, where)
+                    winner = winner if winner.eligible else match
+                return True
+
+            else:
+                return False
+        else:
+            return False
+
+
+    def choose_winner(self, other, method: str, where: str):
+        """Shell function to call the specific algorithm for choosing a winner. The child function
+        overwrites the original parent functions method
+
+        Args:
+            other (obj): another IntraMatch derivative object that gets mapped onto this one
+            method (str): description of the matching method that led to this ambiguous result
+            where (str): where in the pipeline it occurred
+        """
+
+        self.choose_winner_ucids(other, method, where)
+
+    def choose_winner_ucids(self, other, method: str, where: str):
         """when given this object and another that matches to it. Determine which should be the "parent" based on ucid and entity length
 
         Args:
@@ -134,6 +267,7 @@ class IntraMatch(object):
         """
         # if pointing to another object, this one is no longer eligible to be another nodes parent
         self.POINTS_TO = other.name
+        self.POINTS_TO_SID = other.POINTS_TO_SID
         self.eligible = False
         # if it matched onto another one, it's children would have been transferred before this function is called
         # therefore setting this to empty is safe and won't be tossing data
@@ -194,32 +328,35 @@ class FreeMatch(IntraMatch):
     Args:
         IntraMatch (obj): parent class
     """
-    def __init__(self,  name, n_ucids, courts =[], FJC_Info = None, SJID = "Inconclusive"):
+    def __init__(self,  name: str, additional_reprs: list, n_ucids: int, courts: list =[], 
+        FJC_NID: int = None, BA_MAG_ID: str = None, serial_id: int = 0, SJID: str = "Inconclusive"):
         """init method for freeform disambiguation nodes
 
         Args:
             name (str): entity name
+            additional_reprs (list): list of known other variants of this entity's name
             n_ucids (int): number of unique ucids this particular entity string appeared on in total
             courts (list, optional): courts the exact spelling of the entity appeared in. Defaults to [].
-            FJC_Info (dict, optional): if this node is being instantiated using FJC_Info, it is in this dict and should be unpacked to object attributes. Defaults to None.
+            FJC_NID (int, optional): if this node is being instantiated using the FJC, then this is the NID. Defaults to None.
+            BA_MAG_NID (str, optional): if this node is being instantiated using the BA/MAG dataset, then this is the BAMAGID. Defaults to None.
             SJID (str, optional): if this is a second run of disambiguation and this node already had an SJID, use it when creating the object, otherwise leave as inconclusive
         """
-        # unpack the FJC Data if it exists for this entity
-        if FJC_Info:
+
+        # bools to label if these are ground truth entity nodes
+        self.is_FJC = False
+        self.is_BA_MAG = False
+        # if so, the ground truth identifiers are stored here
+        self.NID = FJC_NID
+        self.BA_MAG_ID = BA_MAG_ID
+        if not pd.isna(FJC_NID):
             self.is_FJC = True
-            self.Full_Name = FJC_Info["Full_Name"]
-            self.NID = FJC_Info["NID"]
-            self.Earliest_Commission = FJC_Info["Earliest_Commission"]
-            self.Latest_Termination = FJC_Info["Latest_Termination"]
-            self.courts = []
-        else:
-            self.is_FJC = False
-            self.Full_Name = None
-            self.NID = None
-            self.Earliest_Commission = None
-            self.Latest_Termination = None
-            self.courts = courts
-        
+        if not pd.isna(BA_MAG_ID):
+            self.is_BA_MAG = True
+
+        # the courts this entity appeared in
+        self.courts = courts
+
+        # if there was an SJID, instantiate accordingly
         if SJID == "Inconclusive":
             self.has_SJID = False
             self.SJID = None
@@ -227,9 +364,20 @@ class FreeMatch(IntraMatch):
             self.has_SJID = True
             self.SJID = SJID
         
-        super().__init__(name, n_ucids)
+        super().__init__(name, n_ucids, additional_reprs, serial_id)
         
-    def set_SJID(self, new_id):
+    
+    def adopt_courts(self, other):
+        """If two entities were matched, this gets called to update the entity coverage across courts
+
+        Args:
+            other (obj): another FreeMatch object
+        """
+        self.courts += other.courts
+        self.courts = list(set(self.courts))
+        return
+
+    def set_SJID(self, new_id: str):
         """Internal setter method for the SJID, assumes this will be a known SJID and not "inconclusive"
 
         Args:
@@ -240,63 +388,119 @@ class FreeMatch(IntraMatch):
         self.SJID= new_id
         return
     
-    def set_NID(self, new_id):
+    def set_NID(self, new_id: str):
         """Internal setter method for the NID if the judge is an FJC judge. Assumed the NID is correct and that the entity has already been checked as an FJC Article III Judge
 
         Args:
             new_id (str): the FJC known NID for the judge entity
         """
-        self.NID = new_id
+        if not pd.isna(new_id):
+            self.is_FJC=True
+            self.NID = new_id
 
+    def set_BA_MAG_ID(self, new_id):
+        """Internal setter method for the BAMAG ID if the judge is a Bankruptcy/Magistrate.
 
-    def choose_winner(self, other, method):
+        Args:
+            new_id (str): the UVA ID for the BAMAG entity
+        """
+        if not pd.isna(new_id):
+            self.is_BA_MAG = True
+            self.BA_MAG_ID = new_id
+
+    def choose_winner(self, other, method: str, where: str='Free'):
         """method used to compare 2 entities that matched to each other. Comparison determines which entity should be the "parent"
 
         Args:
             other (obj): other freematch node that matched this one
             method (str): where in disambiguation did these two nodes match each other
+            where (str): where in the pipeline it happened, defaults to free matching
         """
 
-        # if 2 entities each have an SJID, they cannot match to each other. From a disambiguation routine process -- this could happen if they are the same name, but different people, OR if they are jr/sr OR extremely close names
+        # if 2 entities each have an SJID, they cannot match to each other. 
+        # From a disambiguation routine process -- this could happen if they are the same name, 
+        # but different people, OR if they are jr/sr OR extremely close names
         if self.has_SJID and other.has_SJID:
             # this is bad and they should not match. RIP
             return
+        elif self.is_BA_MAG and other.is_BA_MAG and self.BA_MAG_ID != other.BA_MAG_ID:
+            # mismatched IDs here seems to be an issue, shouldn't match
+            print(f"UPDATE CHECK VOIDED: {self.name} {self.BA_MAG_ID}-- {other.name} {other.BA_MAG_ID}")
+            return
+        # NEXT 2 BLOCKS: 
+        #       we know theyre not both SJID tagged
+        #       we know they do not share a BA_MAG ID
         # if one has an SJID and the other does not
         elif self.has_SJID and not other.has_SJID:
-            # if both are FJC judges, this shouldnt happen
+            # if both are FJC judges, this cannot match
             if self.is_FJC and other.is_FJC:
                 # this seems bad, shouldnt happen
                 return
-            # if one is an FJC judge and the other isn't, we want the FJC judge to win (i.e. was an SJID on a magistrate, but now turned FJC judge --> same entity, defer to FJC information node)
+            # if the SJID is also FJC, it is winner if other is not FJC
             elif self.is_FJC and not other.is_FJC:
                 winner = self
                 loser = other
-                winner.free_adopt_children(loser, method, "Free")
+                winner.adopt_children(loser, method, "Free")
             # vice versa
+            # SJID was not originally FJC, other is FJC data - new one wins, takes SJID
             elif not self.is_FJC and other.is_FJC:
                 winner = other
                 loser = self
-                winner.free_adopt_children(loser, method, "Free")
+                winner.adopt_children(loser, method, "Free")
+            # neither is an FJC entity, HERE WE CHECK IF BA_MAG
             else:
-                winner = self
-                loser = other
-                winner.free_adopt_children(loser, method, "Free")
+                # WE KNOW:
+                #   self has an SJID, but is not FJC
+                #   other does not have an SJID, is not FJC
+                # if other has a ba_mag id and self does not, other becomes winner
+                if other.is_BA_MAG and not self.is_BA_MAG:
+                    winner = other
+                    loser = self
+                    winner.adopt_children(loser, method, "Free")
+                # elif other is ba_mag AND self is too, --> they must be the same to be here,
+                #   winner stays as having SJID
+                # elif other not ba_mag, but self is --> self wins still
+                # else neither ba_mag --> self wins
+                else:
+                    winner = self
+                    loser = other
+                    winner.adopt_children(loser, method, "Free")
+        # --- mirrored logic of the above block
+        # self no sjid, but the other one does
         elif not self.has_SJID and other.has_SJID:
             if self.is_FJC and other.is_FJC:
                 # this seems bad, shouldnt happen
                 return
+            # self was not SJID, other was 
+            # BUT self is FJC and other is not --> self is new winner
             elif self.is_FJC and not other.is_FJC:
                 winner = self
                 loser = other
-                winner.free_adopt_children(loser, method, "Free")
+                winner.adopt_children(loser, method, "Free")
+            # if self was not FJC and not SJID, and other was FJC and SJID
+            # other wins
             elif not self.is_FJC and other.is_FJC:
                 winner = other
                 loser = self
-                winner.free_adopt_children(loser, method, "Free")
+                winner.adopt_children(loser, method, "Free")
             else:
-                winner = other
-                loser = self
-                winner.free_adopt_children(loser, method, "Free")
+                # WE KNOW:
+                #   self is not SJID, is not FJC
+                #   other is SJID, is not FJC
+                # these are two blank nodes
+                # if self has a ba_mag id and other does not, self wins and takes SJID
+                if self.is_BA_MAG and not other.is_BA_MAG:
+                    winner = self
+                    loser = other
+                    winner.adopt_children(loser, method, "Free")
+                # elif self has BA_MAG and other does too, they must be the same to be here
+                #   --> other wins as it already has the SJID
+                # elif self does not have BA_MAG and other does --> other wins
+                # else neither has BA_MAG, other has sjid --> other wins
+                else:
+                    winner = other
+                    loser = self
+                    winner.adopt_children(loser, method, "Free")
         elif self.is_FJC and other.is_FJC:
             # VERY BAD
             # 2 distinct fjc nodes should not be able to map to each other, if they do just return and don't map them
@@ -304,26 +508,47 @@ class FreeMatch(IntraMatch):
             if method=='Abrams Patch':
                 winner = self
                 loser = other
-                winner.free_adopt_children(loser, method, "Free")
+                winner.adopt_children(loser, method, "Free")
             else:
-                self.log(f"WARNING: Distinct Entities will not be merged [{method}]: {self.Full_Name} | {other.Full_Name}")
+                self.log(f"WARNING: Distinct Entities will not be merged [{method}]: {self.name} | {other.name}")
                 # print("oh no!")
             return
+        ## begin mirror
         # if one entity is an FJC known judge and the other is not, the FJC judge wins
+        ##
         elif self.is_FJC and not other.is_FJC:
             winner = self
             loser = other
-            winner.free_adopt_children(loser, method, "Free")
+            winner.adopt_children(loser, method, "Free")
         elif not self.is_FJC and other.is_FJC:
             winner = other
             loser = self
-            winner.free_adopt_children(loser, method, "Free")
+            winner.adopt_children(loser, method, "Free")
+        ##
+        # 
+        ## end mirror
         # if neither is an FJC judge, use the ucid/token length method from the parent class
         else:
-            self.free_choose_winner_ucids(other, method, "Free")
+            # WE KNOW:
+            #   neither has an SJID
+            #   neither is an FJC Judge
+            # we check -- if one or both has a BA_MAG
+            # self has ba_mag id, other doesnt, self wins
+            if self.is_BA_MAG and not other.is_BA_MAG:
+                winner = self
+                loser = other
+                winner.adopt_children(loser, method, "Free")
+            elif not self.is_BA_MAG and other.is_BA_MAG:
+                winner = other
+                loser = self
+                winner.adopt_children(loser, method, "Free")
+            else:
+                # in this case either they both share the same ba_mag id or neither has one
+                self.free_choose_winner_ucids(other, method, "Free")
 
-    def free_adopt_children(self, other, method, where):
+    def adopt_children(self, other, method, where):
         """method used to assign another entity node to this node as the parent entity
+        NOTE: this intentionally overrides the parent objects method
 
         Args:
             other (obj): another IntraMatch derivative object that gets mapped onto this one
@@ -332,20 +557,48 @@ class FreeMatch(IntraMatch):
         """
 
         # log the disambiguation
-        self.log(f"{where:25} | {method:22} |{other.name:25} --> {self.name:25}")#.info(f"{where:25} | {method:22} |{other.name:25} --> {self.name:25}")
+        self.log(f"{where:25} | {method:22} |{other.name:25} --> {self.name:25}")
 
         if self.has_SJID and other.has_SJID:
-            print("FAILURE DETECTED")
+            # this shouldnt happen
+            print("FAILURE DETECTED", method, where)
+            print(vars(self))
+            print(vars(other))
+            
         elif not self.has_SJID and other.has_SJID:   
-            # if the other node already had children disambiguated to it, take those as well
+            # if the other NODE had an SJID, but this one wins
+            # if we had no NID or BAMAGID we can absorb
+            # check if we can absorb an NID or BA_MAG ID
             self.set_SJID(other.SJID)
-            self.set_NID(other.NID)
+            if not self.is_FJC and other.is_FJC:
+                self.set_NID(other.NID)
+            if not self.is_BA_MAG and other.is_BA_MAG:
+                self.set_BA_MAG_ID(other.BA_MAG_ID)
         elif self.has_SJID and not other.has_SJID:
+            #   there is a niche chance the winner had an SJID and an NID, but no BAMAGID
+            #       and that the loser had no NID but a BAMAGID
+            #       in that case we want the BAMAGID everywhere
+            if not self.is_BA_MAG and other.is_BA_MAG:
+                self.set_BA_MAG_ID(other.BA_MAG_ID)
+            # now that we have re-calibrated our BA_MAG_ID if necessary...
+            # set everywhere
+
+            # if we had an SJID, and the other did not
+            # the loser will never be a new NID
             other.set_SJID(self.SJID)
             other.set_NID(self.NID)
+            other.set_BA_MAG_ID(self.BA_MAG_ID)
+            # if the other node already had children disambiguated to it, take those as well
             for each in other.children:
                 each.set_SJID(self.SJID)
                 each.set_NID(self.NID)
+                each.set_BA_MAG_ID(self.BA_MAG_ID)
+        
+        else:
+            if not self.is_FJC and other.is_FJC:
+                self.set_NID(other.NID)
+            if not self.is_BA_MAG and other.is_BA_MAG:
+                self.set_BA_MAG_ID(other.BA_MAG_ID)
         
         # add the child node to a list of children
         self.children.append(other)
@@ -368,12 +621,12 @@ class FreeMatch(IntraMatch):
         if self.token_length ==1 and other.token_length >1:
             winner = other
             loser = self                
-            winner.free_adopt_children(loser, method, where)
+            winner.adopt_children(loser, method, where)
 
         elif self.token_length >1 and other.token_length ==1:
             winner = self
             loser = other                
-            winner.free_adopt_children(loser, method, where)
+            winner.adopt_children(loser, method, where)
 
         # if both are multi-token entities, determine winner by number of unique ucid appearances for the entity
         # rationale: the more frequently a name is written, the more likely it is to be the "true" spelling
@@ -385,7 +638,7 @@ class FreeMatch(IntraMatch):
                 UMax = max(U_comp)
                 winner = [o for o in [self, other] if o.n_ucids == UMax][0]
                 loser = [o for o in [self, other] if o != winner][0]                   
-                winner.free_adopt_children(loser, method, where)
+                winner.adopt_children(loser, method, where)
             else:
                 # equal number of ucids
                 # choose by token length, then by character length
@@ -393,7 +646,7 @@ class FreeMatch(IntraMatch):
                 sorty = sorted([self,other], key=lambda obj: (len(obj.base_tokens), len(obj.name)), reverse = True)
                 winner = sorty[0]
                 loser = sorty[1]
-                winner.free_adopt_children(loser, method, where)
+                winner.adopt_children(loser, method, where)
         return
 
 
@@ -403,11 +656,15 @@ class Algorithmic_Mapping(object):
     Args:
         object (obj): class method to estimate an entity label
     """
-    def __init__(self, name, is_FJC, FJC_Info, Prefixes, Head_UCIDs, Tot_UCIDs, Prior_SJID = None):
+    def __init__(self, name: str, serial_id: int,
+        is_FJC: bool, FJC_Info: dict,
+        is_BA_MAG: bool, BA_MAG_Info: dict,
+        Prefixes: dict, Head_UCIDs: int, Tot_UCIDs: int, Prior_SJID: str = None):
         """init method for the class
 
         Args:
             name (str): final entity name
+            serial_id (int): the objects original unique identifier
             is_FJC (bool): does this entity have an nid and FJC appointments
             FJC_Info (dict): the FJC data if it exists, else empty dict
             Prefixes (dict): dict of prefix label counts keyed by mutually exclusive bucket i.e. {"Bankruptcy_Judge": 100 ucids, "Magistrated_Judge":2 ucids}
@@ -416,8 +673,11 @@ class Algorithmic_Mapping(object):
             Prior_SJID (str, optional): if the entity previously had an SJID, take that and keep it assigned, otherwise default to None
         """
         self.name = name
+        self.serial_id = serial_id
         self.is_FJC = is_FJC
         self.FJC_Info = FJC_Info
+        self.is_BA_MAG = is_BA_MAG
+        self.BA_MAG_Info = BA_MAG_Info
         self.Prefixes = Prefixes
         self.Head_UCIDs = Head_UCIDs
         self.Tot_UCIDs = Tot_UCIDs
@@ -442,7 +702,7 @@ class Algorithmic_Mapping(object):
         this weighting will be used in labelling
         """
         # an FJC judge does not need predictive labelling, so we return early and don't build proportions
-        if self.is_FJC or (self.Prior_SJID and not self.Prefixes):
+        if self.is_FJC or (not pd.isna(self.Prior_SJID) and not self.Prefixes) or self.is_BA_MAG:
             self.relative_proportions = {}
             self.judgey_proportion = None
             return
@@ -452,8 +712,7 @@ class Algorithmic_Mapping(object):
 
         # determine what percentage of the time of all entity appearances, that the pretext had "judgey-like" terms
         judgey = ['Bankruptcy_Judge', 'Circuit_Appeals', 'District_Judge', 'Magistrate_Judge','Nondescript_Judge']
-        judgey_proportion = 100*sum([v for k,v in self.Prefixes.items() if k in judgey])/sum(self.Prefixes.values())
-        
+        judgey_proportion = 100*sum([v for k,v in self.Prefixes.items() if k in judgey])/sum(self.Prefixes.values()) 
         # assign to self
         self.relative_proportions = relative_proportions
         for k in judgey:
@@ -468,7 +727,10 @@ class Algorithmic_Mapping(object):
         Args:
             g (str): guessed entity label
         """
-        self.SCALES_Guess = g
+        if 'deny' in g and not pd.isna(self.Prior_SJID):
+            self.SCALES_Guess = "Maintain Prior JEL"
+        else:
+            self.SCALES_Guess = g
         
         
     def Label_Algorithm(self):
@@ -482,9 +744,13 @@ class Algorithmic_Mapping(object):
         if self.is_FJC:
             self.set_guess("FJC Judge")
             return
+        
+        if self.is_BA_MAG:
+            self.set_guess("BA-MAG Judge")
+            return
 
         # low frequency we do not consider, fail early
-        if self.Tot_UCIDs <=3:
+        if self.Tot_UCIDs <=3 and self.Head_UCIDs==0:
             self.set_guess("deny - low occurence")
             return
 
@@ -593,6 +859,8 @@ class Algorithmic_Mapping(object):
     def build_row(self, update = False):
         """take the entity attributes and return them as a row of data
 
+        Args:
+            update (bool, optional): is this during disambiguation update. Defaults to False
         Returns:
             dict: entity attributes
         """
@@ -639,22 +907,25 @@ class Algorithmic_Mapping(object):
             dict: selected entity attributes for the JEL
         """
         return {"name": self.name,
+                "serial_id":self.serial_id,
                 "Presentable_Name": self.pretty_name,
                 "SJID": self.SJID,
                 "SCALES_Guess": self.SCALES_Guess, 
                 "is_FJC": self.is_FJC, 
+                **self.FJC_Info,
+                "is_BA_MAG": self.is_BA_MAG,
+                **self.BA_MAG_Info,
                 "Head_UCIDs": self.Head_UCIDs, 
-                "Tot_UCIDs": self.Tot_UCIDs, 
-               **self.FJC_Info}
+                "Tot_UCIDs": self.Tot_UCIDs}
 
-
+#### THIS IS NOT DEPRECATED, KEEP IT!!!
 class UPDATER_NODE(object):
     """Special class object to be used when updating a new case to tag judge entities on it
 
     Args:
         object (obj): custom object for updating a case
     """
-    def __init__(self,  cleaned_name):
+    def __init__(self,  cleaned_name: str):
         """init method
 
         Args:
@@ -710,7 +981,7 @@ class JEL_NODE(UPDATER_NODE):
     Args:
         UPDATER_NODE (obj): parent class
     """
-    def __init__(self,  name, sjid):
+    def __init__(self,  name: str, sjid: str):
         """init function for a JEL object, a known disambiguated judge entity (to be used in disambiguation updating)
 
         Args:

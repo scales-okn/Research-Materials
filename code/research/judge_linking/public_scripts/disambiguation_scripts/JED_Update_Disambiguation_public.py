@@ -16,51 +16,59 @@ import JED_Algorithms_public as JA
 if __name__ == "__main__":
 
     cfg = JU.ingest_disambiguation_update_config('config_disambiguation_update.cfg')
-
+    paths = cfg['OUT_PATHS']
 
     # Gather in the new extracted entity data
     raw_df, heads_df = JCF.ingest_raw_entities(cfg['DATA_FILES'])  
 
-    # fjc demographics
-    fjc_active = JCF.ingest_the_fjc(
-        cfg['FJC']['fjc_file'],
-        low = cfg['FJC']['Low'],
-        high = cfg['FJC']['High'],
-        is_update=True)  
-
-    # bring in docket data for year information
-    # dockets table for year/filing dates
-    dockets = dtools.load_unique_files_df()
-    all_dockets = dtools.load_unique_files_df()
-    # parties and counsels
-    parties = JCF.ingest_header_entities(cfg['DATA_PARTIES'])
-    counsels = JCF.ingest_header_entities(cfg['DATA_COUNSELS'])
+    raw_df = raw_df[raw_df.year==2017].copy()
+    heads_df =  heads_df[heads_df.year==2017].copy()
 
     # load in the prior iteration of the JEL that we will be updating
     oldJEL = pd.read_json(cfg['JEL'], lines=True)
-    # identify the previoulsy known NIDs of FJC judges
-    oldNIDS = [str(i).split('.')[0] for i in oldJEL.NID.values if not pd.isna(i)]
 
-    # identify the updated codebook judges that we did not know about before
-    # -- it is possible that a new FJC judge was a previoulsy identified magistrate in the JEL
-    # -- this gets addressed in disambiguation code, don't you worry
-    newest_fjc = fjc_active[~fjc_active.nid.isin(oldNIDS)]
+    # fjc demographics
+    fjc_active = JCF.ingest_the_fjc(
+        cfg['FJC']['fjc_file'])  
 
-    # for the new dockets, run them through the standard cleaning and preparation pipeline
-    FDF = JP.PIPELINE_Disambiguation_Prep(raw_df, heads_df, dockets)
+    ba_mag = JCF.ingest_ba_mag(
+        cfg['BA_MAG']['judges'], 
+        cfg['BA_MAG']['positions']
+        )
 
-    # # for the new dockets again, run through UCID only matching and then court only matching
-    # # we do this for new ones only because we do not label existing entities as "court"-specific as they may move around.
-    # Because there are no court specifics, if there are duplicate entities they will naturally be merged together during the free match
-    Post_UCID = JP.UCID_MATCH_PIPELINE(FDF, parties, counsels)
-    Post_Court = JP.COURT_MATCH_PIPELINE(Post_UCID)
+    new_ucids = list(set(list(raw_df.ucid.unique())+list(heads_df.ucid.unique())))
+    yrs_old = range(int(cfg['SEL_UPDATE_YRS']['low']),int(cfg['SEL_UPDATE_YRS']['high'])+1)
+    
+    # parties and counsels
+    parties = JCF.ingest_header_entities(cfg['DATA_PARTIES'])
+    counsels = JCF.ingest_header_entities(cfg['DATA_COUNSELS'])
+    
+    dockets = dtools.load_unique_files_df()
+    dockets_old = dockets[
+        ~dockets.index.isin(new_ucids) &
+        dockets.year.isin(yrs_old)
+    ].reset_index()
 
-    # using the old SEL files, old JEL, and new dockets, run a disambiguation routine that keeps all old JEL entities, edits them, or appends to them, and introduces new entities if applicable
-    paths = cfg['OUT_PATHS']
-    readySEL, RPDF, updated_JEL = JP.NEW_DISAMBIGUATION_FREEMATCH_PIPELINE(paths, all_dockets, newest_fjc, fjc_active, oldJEL, Post_Court)
-    # run a final crosscheck through the old and new ucid dockets
-    # if the old ones get changed, we will edit their jsonl files, new ones get instantiated
-    Old_docks, New_docks = JP.PIPE_UPDATE_FINAL_CROSSCHECK(readySEL, RPDF)
+    old_SJID_Data, old_Inconclusive_Data = JU.multi_process_SEL_loader(dockets_old, paths)
 
-    # write it all to file
-    JU.UPDATED_DISAMBIGUATION_TO_JSONL(paths, updated_JEL, Old_docks, New_docks)
+    old_entries, old_heads = JCF.Transform_SEL_to_Disambiguation_Data_Model(old_Inconclusive_Data)
+
+    RAWS = pd.concat([raw_df, old_entries])
+    HEADS = pd.concat([heads_df, old_heads])
+
+    RAWS.index = range(len(RAWS))
+    HEADS.index = range(len(HEADS))
+
+    # for the inconclusive and new rows, run them through the standard cleaning and preparation pipeline
+    PreDF = JP.PIPELINE_Disambiguation_Prep(RAWS, HEADS, oldJEL)
+
+    
+    Post_UCID = JP.UCID_MATCH_PIPELINE(PreDF, parties, counsels)
+       
+    ID_Mappings, ALL_NODE_IDs = JP.COURT_MATCH_PIPELINE(Post_UCID, fjc_active, ba_mag)
+
+    FPCID, newJEL = JP.PIPE_UPDATE_FREE_MATCH(ID_Mappings, ALL_NODE_IDs, oldJEL, old_SJID_Data, fjc_active)
+
+    PRE_SEL = JA.FINAL_CLEANUP(FPCID)
+
+    JU.UPDATE_WRITER(PRE_SEL, newJEL, dockets_old, paths)    

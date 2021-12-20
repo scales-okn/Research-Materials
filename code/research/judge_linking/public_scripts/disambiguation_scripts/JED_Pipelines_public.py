@@ -1,22 +1,22 @@
 import pandas as pd
 import tqdm
-import re
 
 from collections import defaultdict
 import JED_Classes_public as JED_Classes
 import JED_Cleaning_Functions_public as JCF
 import JED_Algorithms_public as JA
 import JED_Utilities_public as JU
+import JED_Globals_public as JG
 
 from fuzzywuzzy import fuzz
 
-def PIPELINE_Disambiguation_Prep(entry_frame, header_frame, dockets):
+def PIPELINE_Disambiguation_Prep(entry_frame: pd.DataFrame, header_frame: pd.DataFrame, JEL=[]):
     """Preliminary cleaning and respanning to prep the data for disambiguation
 
     Args:
         entry_frame (pandas.DataFrame): extracted entities using spacy model on docket entries
         header_frame (pandas.DataFrame): extracted entities from header metadata
-        dockets (pandas.DataFrame): unique files table loaded using settings
+        JEL (pandas.DataFrame or empty list): a formerly created JEL table or empty list
 
     Returns:
         pandas.DataFrame: combined dataframe of all rows to be used in disambiguation
@@ -29,7 +29,7 @@ def PIPELINE_Disambiguation_Prep(entry_frame, header_frame, dockets):
     hdf = header_frame
 
     # run the cleaning and respanning processes on each dataframe independently
-    edf = single_df_pipeline(edf, is_header=False)
+    edf = single_df_pipeline(edf, is_header=False, JEL=JEL)
     hdf = single_df_pipeline(hdf, is_header=True)
     
     # clean all the entities in preparation for disambiguation
@@ -44,12 +44,13 @@ def PIPELINE_Disambiguation_Prep(entry_frame, header_frame, dockets):
     return fdf
 
 
-def single_df_pipeline(DF, is_header):
+def single_df_pipeline(DF: pd.DataFrame, is_header: bool, JEL=[]):
     """Cleaning and respanning functions for the raw spacy extracted entities
 
     Args:
         DF (pandas.DataFrame): raw extracted entities either from spacy extractions or header metadata
         is_header (bool): is this the header dataframe
+        JEL (pandas.DataFrame or empty list): a formerly created JEL table or empty list
 
     Returns:
         pandas.DataFrame: dataframe with cleaned, respanned entities, with pretext classified
@@ -63,7 +64,7 @@ def single_df_pipeline(DF, is_header):
     # to account for the language bias the model has
     if not is_header:
         print(">> Corrective Actions")
-        DF = JCF.reshuffle_exception_entities(DF)
+        DF = JCF.reshuffle_exception_entities(DF, JEL)
 
     print(">> Initial Eligibility Check")
     DF = JCF.eligibility(DF, "extracted_entity")
@@ -102,7 +103,7 @@ def single_df_pipeline(DF, is_header):
 
     return FIN
 
-def cleaning_pipe(df):
+def cleaning_pipe(df: pd.DataFrame):
     """take a dataframe of entities and clean them, then identify their true spans in the original entries
 
     Args:
@@ -158,7 +159,7 @@ def cleaning_pipe(df):
          
     return df
 
-def pipe_junction(df_entries, df_headers):
+def pipe_junction(df_entries: pd.DataFrame, df_headers: pd.DataFrame):
     """take both the header and entry dataframe and combine their overall unique entities for cleaning
 
     Args:
@@ -169,7 +170,7 @@ def pipe_junction(df_entries, df_headers):
         pandas.DataFrame, pandas.DataFrame: entry and header dataframes with the cleaned entity column added
     """
     
-    print("\nFirst Junction Pipe Running")
+    print("First Junction Pipe Running")
     # get all unique judge-like entities pre-disambiguation
     JUDGES = set(
         list(df_entries[df_entries.eligible].New_Entity.unique()) +
@@ -190,7 +191,7 @@ def pipe_junction(df_entries, df_headers):
     return df_entries, df_headers
 
 
-def pipe_UCID_Counts(df_entries, df_headers):
+def pipe_UCID_Counts(df_entries: pd.DataFrame, df_headers: pd.DataFrame):
     """ Take the entity and header dataframes and determine for each entity,
     how many cases does it appear on in its respective court
 
@@ -202,7 +203,7 @@ def pipe_UCID_Counts(df_entries, df_headers):
         pandas.DataFrame, pandas.DataFrame: entry and header dataframes with the ucid count column added
     """
     
-    print("\nPrimary UCID Count pipe running")
+    print("Primary UCID Count pipe running")
     print(">> Aggregating counts by Court")
     # create triples of entity, ucid, court
     ee = zip(df_entries.Cleaned_Entity, df_entries.ucid, df_entries.court)
@@ -263,7 +264,7 @@ def pipe_UCID_Counts(df_entries, df_headers):
         
     return dfe, dfh
 
-def pipe_concatenation(df_entries, df_headers):
+def pipe_concatenation(df_entries: pd.DataFrame, df_headers: pd.DataFrame):
     """Join header and entry dataframes into one large dataset pre-disambiguation
 
     Args:
@@ -274,7 +275,7 @@ def pipe_concatenation(df_entries, df_headers):
         pandas.DataFrame: Pre-SEL dataframe with row per entity to be used in disambiguation
     """
     
-    print("\nLast Junction Pipe Running - Combining Header and Entry Data")
+    print("Last Junction Pipe Running - Combining Header and Entry Data")
     
     # any entity that 
     # appeared on only 1 ucid
@@ -299,12 +300,15 @@ def pipe_concatenation(df_entries, df_headers):
 
     # Columns I want to keep from both dataframes, and will use to concat the 2 together
     SEL_COLS =['Entity_Extraction_Method', 'docket_source', 'judge_enum', 'party_enum', 'pacer_id', 'docket_index',
-           'ucid','cid','court','year',#'filing_date',
+           'ucid','cid','court','year','entry_or_filing_date',
            'original_text','extracted_entity','New_Pre_Tokens','New_Entity','New_Post_Tokens','Cleaned_Entity',
            'Prefix_Categories','Transferred_Flag','full_span_start','full_span_end','New_Span_Start','New_Span_End',
            'eligible','N_ucids']
     
     print(">> Concatenating Pre-SEL DataFrame")
+    fin_e.rename({'entry_date':'entry_or_filing_date'}, axis=1, inplace=True)
+    fin_h.rename({'filing_date':'entry_or_filing_date'}, axis=1, inplace=True)
+
     PRE_SEL_E = fin_e[SEL_COLS]
     PRE_SEL_H = fin_h[SEL_COLS]
     
@@ -314,7 +318,39 @@ def pipe_concatenation(df_entries, df_headers):
     return RET
 
 
-def UCID_MATCH_PIPELINE(FDF, parties, counsels):
+def Single_UCID_Pipeline(entity_list: list, ucid: str):
+    """List of IntraMatch objects that are going to be reduced within a ucid if possible
+
+    Args:
+        entity_list (list): list of IntraMatch objects belonging to the ucid
+        ucid (str): the SCALES ucid corresponding to the case
+
+    Returns:
+        list: same list of objects that entered the function, with updated pointers if any mapped to each other
+    """
+
+    updated_list = JA.PIPE_Fuzzy_Matching(entity_list, ucid) # generic fuzzy match
+
+    updated_list = JA.PIPE_Tokens_in_Tokens(updated_list, ucid, False, False, 'Plain') # token in token checks
+    updated_list = JA.PIPE_Tokens_in_Tokens(updated_list, ucid, False, True, 'Plain') # TiT abbreviated middle initial
+    updated_list = JA.PIPE_Tokens_in_Tokens(updated_list, ucid, True, True, 'Plain') # TiT abbreviated first and middle initial
+    updated_list = JA.PIPE_Tokens_in_Tokens(updated_list, ucid, False, False, 'Unified') # universal name spellings
+    updated_list = JA.PIPE_Tokens_in_Tokens(updated_list, ucid, False, False, 'Nicknames') # using nicknames
+
+    updated_list = JA.PIPE_Anchor_Reduction_UCID(updated_list, ucid) # reduce using surnames
+    updated_list = JA.PIPE_Anchor_Reduction_II_UCID(updated_list, ucid) # secondary surname reduction
+    updated_list = JA.PIPE_Anchor_Reduction_III_UCID(updated_list, ucid) # third surname reduction
+
+    return updated_list
+
+def PIPE_Prepare_for_UCID_Layer(FDF: pd.DataFrame, parties: pd.DataFrame, counsels: pd.DataFrame):
+    
+    ucid_map = UCID_PIPE_Object_Builder(FDF) # build the objects for disambiguation
+    ucid_map, toss_map = JA.UCID_PIPE_Drop_Parties(ucid_map, parties, counsels) # drop parties and counsels that were misattributed as judges
+
+    return ucid_map, toss_map
+
+def UCID_MATCH_PIPELINE(FDF: pd.DataFrame, parties: pd.DataFrame, counsels: pd.DataFrame):
     """Disambiguation Pipeline for Intra-UCID entity matching
 
     Args:
@@ -326,53 +362,115 @@ def UCID_MATCH_PIPELINE(FDF, parties, counsels):
         pandas.DataFrame: Updated Df with entities and pointers to their parent entities after intra-ucid matching
     """
 
-    ucid_map = UCID_PIPE_Object_Builder(FDF) # build the objects for disambiguation
-    ucid_map, toss_map = JA.UCID_PIPE_Drop_Parties(ucid_map, parties, counsels) # drop parties and counsels that were misattributed as judges
-    new_map = JA.PIPE_Fuzzy_Matching(ucid_map) # generic fuzzy match
-    new_map = JA.PIPE_Tokens_in_Tokens(new_map, False, False, 'Plain') # token in token checks
-    new_map = JA.PIPE_Tokens_in_Tokens(new_map, False, True, 'Plain') # TiT abbreviated middle initial
-    new_map = JA.PIPE_Tokens_in_Tokens(new_map, True, True, 'Plain') # TiT abbreviated first and middle initial
-    new_map = JA.PIPE_Tokens_in_Tokens(new_map, False, False, 'Unified') # universal name spellings
-    new_map = JA.PIPE_Tokens_in_Tokens(new_map, False, False, 'Nicknames') # using nicknames
-    new_map = JA.PIPE_Anchor_Reduction_UCID(new_map) # reduce using surnames
-    new_map = JA.PIPE_Anchor_Reduction_II_UCID(new_map) # secondary surname reduction
-    new_map = JA.PIPE_Anchor_Reduction_III_UCID(new_map) # third surname reduction
-    UCID_df = UCID_PIPE_Build_Remapped_Lookup(new_map, toss_map, FDF) # remap into a Dataframe
+    ucid_map, toss_map = PIPE_Prepare_for_UCID_Layer(FDF, parties, counsels)
+   
+    # NEED NEW_MAP IN THE END
+    end_map = {}
+    for ucid, entity_list in ucid_map.items():
+        end_map[ucid] = Single_UCID_Pipeline(entity_list, ucid)
     
+    UCID_df = UCID_PIPE_Build_Remapped_Lookup(end_map, toss_map, FDF) # remap into a Dataframe
+    # in frame shape will not match outframe shape if any parties or counsels were detected and dropped
+
     return UCID_df
 
-def COURT_MATCH_PIPELINE(Post_UCID):
+def Single_Court_Pipeline(entity_list_long: list, entity_list_short: list, court: str):
+    """a cycling function that takes a courts list of entities and cycles through various disambiguation algorithms with them
+
+    Args:
+        entity_list_long (list): list of IntraMatch objects in a ucid/court we are trying to reduce that are multi-tokened
+        entity_list_short (list): list of IntraMatch objects in a ucid/court we are trying to reduce that are single-tokened
+        court (str): used for logging to indicate where in the pipeline the matching is happening
+
+    Returns:
+        list: list of the combined single and multi-token objects that entered the function, now pointing and mapped to each other
+    """
+
+    updated_map_long = JA.PIPE_Fuzzy_Matching(entity_list_long, court)
+    updated_map_long = JA.PIPE_Tokens_in_Tokens(updated_map_long, court, False, False, 'Plain')
+    updated_map_long = JA.PIPE_Tokens_in_Tokens(updated_map_long, court, False, True, 'Plain')
+    updated_map_long = JA.PIPE_Tokens_in_Tokens(updated_map_long, court, True, True, 'Plain')
+    updated_map_long = JA.PIPE_Tokens_in_Tokens(updated_map_long, court, False, False, 'Unified')
+    updated_map_long = JA.PIPE_Tokens_in_Tokens(updated_map_long, court, False, False, 'Nicknames')
+    updated_map_long = JA.PIPE_Tokens_in_Tokens(updated_map_long, court, False, True, 'Nicknames')
+    updated_map_long = JA.PIPE_UCID_COURT_INITIALISMS(updated_map_long, court)
+    updated_map_single = JA.PIPE_COURT_Anchors_Self_Reduction(entity_list_short, court)
+
+    updated_map = JA.PIPE_Anchor_Reduction_Court(updated_map_long, updated_map_single, court)
+    return updated_map
+
+
+def COURT_MATCH_PIPELINE(Post_UCID: pd.DataFrame, fjc_active: pd.DataFrame, ba_mag: pd.DataFrame):
     """Disambiguation Pipeline for Intra-Court entity matching
 
     Args:
         Post_UCID (pandas.DataFrame): post-ucid matching df
+        fjc_active (pandas.DataFrame): loaded and transformed ground truth entity file from the FJC
+        ba_mag (pandas.DataFrame): loaded and transformed ground truth entity file from the UVA BA/MAG dataset
 
     Returns:
         pandas.DataFrame: again disambiguated in court, now with a column mapping to newest parent entities
     """
     # build the objects and split into single or multi-token names
-    court_map_long, court_map_single = COURT_PIPE_Object_Builder(Post_UCID)
+    court_map_long, court_map_single, serial_init, GDF = COURT_PIPE_Object_Builder(Post_UCID)
+    FJC_Nodes, serial_init = FJC_Node_Creator(fjc_active, serial_init)
+    BA_MAG_Nodes, serial_init = BA_MAG_Node_Creator(ba_mag, serial_init)
 
-    court_map_long = JA.PIPE_Fuzzy_Matching(court_map_long)
-    court_map_long = JA.PIPE_Tokens_in_Tokens(court_map_long, False, False, 'Plain')
-    court_map_long = JA.PIPE_Tokens_in_Tokens(court_map_long, False, True, 'Plain')
-    court_map_long = JA.PIPE_Tokens_in_Tokens(court_map_long, True, True, 'Plain')
-    court_map_long = JA.PIPE_Tokens_in_Tokens(court_map_long, False, False, 'Unified')
-    court_map_long = JA.PIPE_Tokens_in_Tokens(court_map_long, False, False, 'Nicknames')
-    court_map_long = JA.PIPE_Tokens_in_Tokens(court_map_long, False, True, 'Nicknames')
+    # slice the ground truth objects into their respective courts
+    unallocated_remainder = []
+    for court, objs in FJC_Nodes.items():
+        if court in court_map_long:
+            court_map_long[court]+=objs
+        else:
+            unallocated_remainder+=objs
+    for court, objs in BA_MAG_Nodes.items():
+        if court in court_map_long:
+            court_map_long[court]+=objs
+        else:
+            unallocated_remainder+=objs
+
+    # disambiguate within each court
+    court_map = {}
+    for court in set(court_map_long.keys()).union(court_map_single.keys()):
+        court_map[court] = Single_Court_Pipeline(court_map_long[court], court_map_single[court], court)
+
+    # after disambiguation, rebuild the entity dataframe
+    ID_Mappings, ALL_NODE_IDs = COURT_PIPE_Build_Remapped_Lookup(court_map, unallocated_remainder, Post_UCID, GDF)
+
+    return ID_Mappings, ALL_NODE_IDs
+
+
+def FREE_MATCH_CYCLER(ACTIVE_NODES: list):
+    """Cycler function that takes a large list of entities and considers them for disambiguation in a court-agnostic context
+
+    Args:
+        ACTIVE_NODES (list): list of the entity objects to be disambiguated in free matching
+
+    Returns:
+        list: list of the entity objects that entered the function, now pointing and mapped to each other
+    """
     
-    court_map = JA.PIPE_Anchor_Reduction_Court(court_map_long, court_map_single)
-    
-    Court_df = COURT_PIPE_Build_Remapped_Lookup(court_map, Post_UCID)
+    ACTIVE_NODES = JA.PIPE_Free_Exact_Beginning(ACTIVE_NODES)
+    ACTIVE_NODES = JA.PIPE_Free_Fuzzy_Pool_Based(ACTIVE_NODES)
+    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens_Pool_Based(ACTIVE_NODES, False, False, 'Plain')
+    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens_Pool_Based(ACTIVE_NODES, False, True, 'Plain')
+    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens_Pool_Based(ACTIVE_NODES, False, False, 'Unified')
+    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens_Pool_Based(ACTIVE_NODES, False, False, 'Nicknames')
+    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens_Pool_Based(ACTIVE_NODES, False, True, 'Nicknames')
+    ACTIVE_NODES = JA.PIPE_Free_Vacuum_Pool_Based(ACTIVE_NODES)
+    ACTIVE_NODES = JA.PIPE_Free_Token_Sort_Pool_Based(ACTIVE_NODES)      
+    ACTIVE_NODES = JA.PIPE_Free_Van_Sweeps_Pool_Based(ACTIVE_NODES)
+    ACTIVE_NODES = JA.PIPE_Free_Initialisms_Pool_Based(ACTIVE_NODES)
+    ACTIVE_NODES = JA.PIPE_Free_Single_Letter_Names_Pool_Based(ACTIVE_NODES)
 
-    return Court_df
+    return ACTIVE_NODES
 
-
-def FREE_MATCH_PIPELINE(Post_Court, fjc_active):
+def FREE_MATCH_PIPELINE(ID_Mappings: pd.DataFrame, ALL_NODE_IDs: list, fjc_active: pd.DataFrame):
     """Final round of disambiguation with no locks on court or ucid
 
     Args:
-        Post_Court (pandas.DataFrame): df after court level disambiguation
+        ID_Mappings (pandas.DataFrame): df after court level disambiguation
+        ALL_NODE_IDs (pandas.DataFrame): df of node ids with their core information up to this point
         fjc_active (pandas.DataFrame): df of FJC judges we wish to include in the JEL
 
     Returns:
@@ -380,86 +478,195 @@ def FREE_MATCH_PIPELINE(Post_Court, fjc_active):
     """
 
     # build our pool of entities to be involved in court-agnostic free-matching. This will now incorporate judges from the FJC biographical dictionary
-    NODES = PIPE_NODE_BUILDER(Post_Court, fjc_active)
+    NODES, ALL_NODE_IDs = PIPE_NODE_BUILDER(ID_Mappings, ALL_NODE_IDs)
     print("Total Nodes: ",len(NODES))
-    ACTIVE_NODES, DORMANT_NODES = PIPE_FIND_DORMANT_FJC(NODES)
+    # when an entity is a ground truth entity it may be duplicated from court matching, reduce them here
+    NODES = reduce_ground_truths(NODES)
 
-    ACTIVE_NODES = JA.PIPE_Free_Fuzzy(ACTIVE_NODES)
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Plain')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, True, 'Plain')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Unified')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Nicknames')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, True, 'Nicknames')
-
-    ACTIVE_NODES = JA.PIPE_Free_Vacuum(ACTIVE_NODES) # vacuum out the middle names and compare entities
-    ACTIVE_NODES = JA.PIPE_Free_Token_Sort(ACTIVE_NODES) # compare tokens in flipped ortders
-    ACTIVE_NODES = JA.PIPE_Free_Van_Sweep(ACTIVE_NODES) # special patch for germanic names
-    ACTIVE_NODES = JA.PIPE_Free_Initialisms(ACTIVE_NODES) # special patch for initial heavy judges
-    ACTIVE_NODES = JA.PIPE_Free_Single_Letters(ACTIVE_NODES) # special patch for judges that go by a single letter of one of their names
-    ACTIVE_NODES = JA.Abrams_Patch(ACTIVE_NODES) # special patch for marital name changes
+    # split out the "dormant" entities that are likely retired and wont appear in our data
+    ACTIVE_NODES, DORMANT_NODES = PIPE_FIND_DORMANT_FJC(NODES, fjc_active)
     
-    FIN_NODES = ACTIVE_NODES + DORMANT_NODES
-
-    Fin_Matched = PIPE_RePoint_Free_Match(Post_Court, FIN_NODES)
+    ACTIVE_NODES = FREE_MATCH_CYCLER(ACTIVE_NODES)
     
-    JEL, SJID_MAP = PIPE_LABEL_AND_BUILD(Fin_Matched, FIN_NODES)
+    ALL_NODES = ACTIVE_NODES+DORMANT_NODES
 
-    # build the SJIDs into the DF
-    Fin_Matched['SJID'] = Fin_Matched.Final_Pointer.map(SJID_MAP)
-    Fin_Matched['SJID'].fillna("Inconclusive", inplace=True)
+    # after disambiguation, recreate the entity dataframe
+    PCID_Mappings, FINAL_NODE_LOOKUP, IREM = PIPE_REPOINT_Free_Match(ALL_NODES, ID_Mappings, ALL_NODE_IDs)
+    
+    # run through the labeller to build SJID labels for the newly disambiguated entities
+    JEL, PCID_Mappings = PIPE_LABEL_AND_BUILD(PCID_Mappings, FINAL_NODE_LOOKUP, IREM)
 
-    return Fin_Matched, JEL
+    return JEL, PCID_Mappings
 
-
-def NEW_DISAMBIGUATION_FREEMATCH_PIPELINE(paths, all_dockets, newest_fjc, fjc_active, oldJEL, Post_Court):
-    """Freematch pipeline that swaps for the original freematch pipeline when a new, updated JEL is being generated. This pipeline accounts for previously identified entities and previously tagged dockets.
+def PIPE_Assess_New_Cases(Post_UCID: pd.DataFrame, Compy_JEL: pd.DataFrame):
+    """for the new case tagger, run through a series of cleaning and tagging of entities. This process
+    does not update the JEL and identify new distinct entities, instead it tags extractions with known
+    entities only
 
     Args:
-        paths (dict): dictionary of various filepaths for SEL files, JEL files, and FJC files
-        all_dockets (pandas.DataFrame): unique files table default loaded from settings file
-        newest_fjc (pandas.DataFrame): DF of new FJC Article III judges only
-        fjc_active (pandas.DataFrame): DF of full FJC codebook as we know it at time of script running (1700s-present)
-        oldJEL (pandas.DataFrame): DF of the old JEL loaded in from JSONL file
-        Post_Court (pandas.DataFrame): DF of the new dockets post ucid and court disambiguation. These rows should be ready for free matching disambiguation
+        Post_UCID (pd.DataFrame): df after ucid level disambiguation
+        Compy_JEL (pd.DataFrame): the old JEL to be used to tag these new cases
 
     Returns:
-        pandas.DataFrame, pandas.DataFrame, pandas.DataFrame: 3 different DFs after disambiguation. readySEL is any updated old SEL file rows, RPDF is the repointed DF of the new dockets only (pointed to mapped disambiguated entities), and updated_JEL is the newest iteration of the JEL.
+        pandas.DataFrame: a dataframe ready to be written out with post-disambiguation data
     """
-    # prep for freematching by loading in the prior SEL dockets we want to pool into disambiguation
-    readySEL = PIPE_PREPARE_UPDATE_FREEMATCH(all_dockets, paths, ['2016', '2019'])
-    
-    # build the object nodes we will use in disambiguation
-    Free_Nodes = PIPE_UPDATE_NODE_BUILDER_FREEMATCH(Post_Court, readySEL, newest_fjc, fjc_active, oldJEL)
+    # IntraMatch dataframe is built using entity, what it points to after ucid matching, the court, and ucids
+    IM = Post_UCID[['Cleaned_Entity','Points_To','court','ucid']]
 
-    # cull the pool before beginning to remove FJC judges that are no longer active, or not likely to show up in our data (i.e. retired by 1995 if we're using 2015-2020 dockets)
-    active, dormant  = PIPE_FIND_DORMANT_FJC(Free_Nodes)
-    
-    # full disambiguation routine
-    ACTIVE_NODES = JA.PIPE_Free_Fuzzy(active)
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Plain')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, True, 'Plain')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Unified')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Nicknames')
-    ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, True, 'Nicknames')
-    ACTIVE_NODES = JA.PIPE_Free_Vacuum(ACTIVE_NODES) # vacuum out the middle names and compare entities
-    ACTIVE_NODES = JA.PIPE_Free_Token_Sort(ACTIVE_NODES) # compare tokens in flipped ortders
-    ACTIVE_NODES = JA.PIPE_Free_Van_Sweep(ACTIVE_NODES) # special patch for germanic names
-    ACTIVE_NODES = JA.PIPE_Free_Initialisms(ACTIVE_NODES) # special patch for initial heavy judges
-    ACTIVE_NODES = JA.PIPE_Free_Single_Letters(ACTIVE_NODES) # special patch for judges that go by a single letter of one of their names
-    ACTIVE_NODES = JA.Abrams_Patch(ACTIVE_NODES) # special patch for marital name changes
+    # group the df by the updated entity (points to) and determine how many unique ucids each of those entities is on
+    GDF = IM.groupby(["Points_To","court"], as_index=False)['ucid'].nunique()
 
-    # when wrapping up, make sure we include all of the dormant nodes again as we still want them included when rebuilding and expanding the JEL
-    FIN_NODES = ACTIVE_NODES + dormant
-    
-    # for the new dockets, repoint any child entities to the correct parent entities
-    RPDF = PIPE_Update_Final_Repoint(Post_Court, FIN_NODES)
-    
-    # tag the old ucids with new entity labels if applicable, build a new JEL
-    readySEL, updated_JEL = PIPE_UPDATE_NEW_LABELS_AND_BUILD(readySEL, RPDF, oldJEL, FIN_NODES)
-    
-    return readySEL, RPDF, updated_JEL
+    # createa  serial id for each row in the dataframe
+    GDF['_Serial_ID'] = range(len(GDF))
 
-def PIPE_FIND_DORMANT_FJC(nodes, time_bound = '1995-01-01'):
+    # determine if any of the extracted entities are just 3 consonants (likely initials which we don't try to disambiguate)
+    TCM = build_triple_consonants_map(GDF.Points_To.unique())
+    GDF['Triple_Consonant'] = GDF.Points_To.map(TCM)
+    
+    # determine entities that qualify for disambiguation
+    # cannot identify triple consonants (intiails) or entities where the maximum token length is 1 character
+    Match_Nodes = GDF[
+        (~GDF.Triple_Consonant)&
+        (GDF.Points_To.apply(lambda x: max( [len(tok) for tok in x.split()])>1))
+    ]
+    
+    # create the network objects for tagging
+    Update_Nodes = []
+    for point_starter, court, n_ucids, serial_id, triple_consonant in tqdm.tqdm([tuple(x) for x in Match_Nodes.to_numpy()]):
+        Update_Nodes.append(
+            JED_Classes.FreeMatch(name= point_starter,
+                                additional_reprs = [],
+                                n_ucids = n_ucids,
+                                courts= [court],
+                                FJC_NID = None, BA_MAG_ID = None,
+                                serial_id= serial_id)
+        )
+        
+    # we treat JEL rows as ground truth objects in this tagging
+    JEL_objs = []
+    for index, row in Compy_JEL.iterrows():
+
+        # if a name has additional variants (marital name, obscure nicknames, etc.)
+        alternates = None
+        if not pd.isnull(row['NID']):
+            alternates = JG.FJC_ADDITIONAL_REPRESENTATIONS.get(row['NID'])
+
+        JEL_objs.append(
+            JED_Classes.FreeMatch(
+            row['name'], alternates, 0, courts=[],
+            FJC_NID= row['NID'], BA_MAG_ID=row['BA_MAG_ID'], serial_id=0, SJID = row['SJID']
+            )
+        )
+    
+    # split the taggable entities into single tokened names or multi-tokened
+    solos = [N for N in Update_Nodes if N.token_length==1 or len(N.tokens_wo_suff)==1]
+    multis = [N for N in Update_Nodes if N not in solos]
+    
+    # reduce the uni-token entities amongst themselves
+    SOLO_OUT = JA.PIPE_Anchor_Reduction_Court(JEL_objs, solos, "New Case Tags")
+    
+    # combine all the multi-token names and groundtruth into one list
+    ACTIVE_NODES = multis+JEL_objs
+    
+    # perform free matching disambiguation on the multi-token name list
+    ACTIVE_NODES = FREE_MATCH_CYCLER(ACTIVE_NODES)
+    
+    input_lookup = []
+    # create a lookup of all the nodes and their IDs
+    inputs= multis+SOLO_OUT
+    for node in inputs:
+        input_lookup.append({
+            'node_name': node.name, # this was the input points to which became the name
+            'original_SID': node.serial_id,
+            'is_eligible': node.eligible,
+            'is_ambiguous': node.is_ambiguous,
+            'Possible_Pointers': [o.SJID for o in node.Possible_Pointers],
+            'SJID':node.SJID
+
+        })
+    IL_NODES = pd.DataFrame(input_lookup)
+    
+    # merge the grouped data with the node lookup
+    RES = GDF.merge(IL_NODES,
+         how='left',
+         left_on = ['_Serial_ID',"Points_To"],
+         right_on= ['original_SID','node_name'])
+    
+    # remap the ambiguous entities if applicable
+    RES['Ambiguous_SJIDS'] = None
+    RES.loc[RES.is_ambiguous, "Ambiguous_SJIDS"] = RES.Possible_Pointers
+    RES.loc[RES.is_ambiguous, "SJID"] = "Ambiguous"
+    
+    # now rebuild the input dataframe, with the pointers updated to the final identified parent entities
+    Disam = Post_UCID.merge(RES[['court','Points_To','SJID','Ambiguous_SJIDS']],
+                   how='left',
+                   left_on = ['court','Points_To'],
+                   right_on = ['court','Points_To'])
+
+    # mark remaining inconclusive entities as such
+    Disam["SJID"].fillna("Inconclusive", inplace=True)
+
+    # change the header prefixes to be nondescript
+    Disam.loc[
+        Disam.Prefix_Categories.isin(
+            ['assigned_judge', 'referred_judges']
+        ), 'Prefix_Categories'] = 'Nondescript_Judge'
+    
+    # do one final crosscheck for remaining inconclusive entities
+    out = JA.FINAL_CLEANUP(Disam)
+    
+    return out
+
+
+# def NEW_DISAMBIGUATION_FREEMATCH_PIPELINE(paths, all_dockets, newest_fjc, fjc_active, oldJEL, Post_Court):
+#     """Freematch pipeline that swaps for the original freematch pipeline when a new, updated JEL is being generated. This pipeline accounts for previously identified entities and previously tagged dockets.
+
+#     Args:
+#         paths (dict): dictionary of various filepaths for SEL files, JEL files, and FJC files
+#         all_dockets (pandas.DataFrame): unique files table default loaded from settings file
+#         newest_fjc (pandas.DataFrame): DF of new FJC Article III judges only
+#         fjc_active (pandas.DataFrame): DF of full FJC codebook as we know it at time of script running (1700s-present)
+#         oldJEL (pandas.DataFrame): DF of the old JEL loaded in from JSONL file
+#         Post_Court (pandas.DataFrame): DF of the new dockets post ucid and court disambiguation. These rows should be ready for free matching disambiguation
+
+#     Returns:
+#         pandas.DataFrame, pandas.DataFrame, pandas.DataFrame: 3 different DFs after disambiguation. readySEL is any updated old SEL file rows, RPDF is the repointed DF of the new dockets only (pointed to mapped disambiguated entities), and updated_JEL is the newest iteration of the JEL.
+#     """
+#     # prep for freematching by loading in the prior SEL dockets we want to pool into disambiguation
+#     readySEL = PIPE_PREPARE_UPDATE_FREEMATCH(all_dockets, paths, ['2016', '2019'])
+    
+#     # build the object nodes we will use in disambiguation
+#     Free_Nodes = PIPE_UPDATE_NODE_BUILDER_FREEMATCH(Post_Court, readySEL, newest_fjc, fjc_active, oldJEL)
+
+#     # cull the pool before beginning to remove FJC judges that are no longer active, or not likely to show up in our data (i.e. retired by 1995 if we're using 2015-2020 dockets)
+#     active, dormant  = PIPE_FIND_DORMANT_FJC(Free_Nodes)
+    
+#     # full disambiguation routine
+#     ACTIVE_NODES = JA.PIPE_Free_Fuzzy(active)
+#     ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Plain')
+#     ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, True, 'Plain')
+#     ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Unified')
+#     ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, False, 'Nicknames')
+#     ACTIVE_NODES = JA.PIPE_Free_Tokens_in_Tokens(ACTIVE_NODES, False, True, 'Nicknames')
+#     ACTIVE_NODES = JA.PIPE_Free_Vacuum(ACTIVE_NODES) # vacuum out the middle names and compare entities
+#     ACTIVE_NODES = JA.PIPE_Free_Token_Sort(ACTIVE_NODES) # compare tokens in flipped ortders
+#     ACTIVE_NODES = JA.PIPE_Free_Van_Sweep(ACTIVE_NODES) # special patch for germanic names
+#     ACTIVE_NODES = JA.PIPE_Free_Initialisms(ACTIVE_NODES) # special patch for initial heavy judges
+#     ACTIVE_NODES = JA.PIPE_Free_Single_Letters(ACTIVE_NODES) # special patch for judges that go by a single letter of one of their names
+#     # ACTIVE_NODES = JA.Abrams_Patch(ACTIVE_NODES) # special patch for marital name changes
+
+#     # when wrapping up, make sure we include all of the dormant nodes again as we still want them included when rebuilding and expanding the JEL
+#     FIN_NODES = ACTIVE_NODES + dormant
+    
+#     # for the new dockets, repoint any child entities to the correct parent entities
+#     RPDF = PIPE_Update_Final_Repoint(Post_Court, FIN_NODES)
+    
+#     # tag the old ucids with new entity labels if applicable, build a new JEL
+#     readySEL, updated_JEL = PIPE_UPDATE_NEW_LABELS_AND_BUILD(readySEL, RPDF, oldJEL, FIN_NODES)
+    
+#     return readySEL, RPDF, updated_JEL
+
+def PIPE_FIND_DORMANT_FJC(nodes, fjc_active, time_bound = '1995-01-01'):
     """Helper function that filters out FJC entities from a disambiguation pool based on their latest termination date as an Article III judge
 
     Args:
@@ -470,23 +677,13 @@ def PIPE_FIND_DORMANT_FJC(nodes, time_bound = '1995-01-01'):
         list, list: returns 2 lists of IntraMatch child objects whose lengths and items sum to the length and items of the original nodes input list. The active list are entities to be used in disambiguation, dormant are those believed to be no longer judges at the time of the dockets filing in the disambiguation pool.
     """
 
-    # can only reliably filter FJC nodes
-    fjc_nodes = [n for n in nodes if n.is_FJC]
-    
-    # dormant if the latest termination was before the input time bound
-    fjc_dormant = [n for n in fjc_nodes if n.Latest_Termination <= pd.to_datetime(time_bound).date()]
-    # active is not dormant
-    fjc_active = [n for n in fjc_nodes if n not in fjc_dormant]
+    TERM_MAP = {nid:tdate for nid, tdate in fjc_active[[('nid',''),('Termination Date','max')]].to_numpy()}
+    dormant_nids = {k:v for k,v in TERM_MAP.items() if v <= pd.to_datetime(time_bound).date()}
 
-    # any remaining node that wasnt an FJC entitiy
-    non_fjc = [n for n in nodes if not n.is_FJC]
+    dormant_nodes = [N for N in nodes if N.NID in dormant_nids]
+    active_nodes = [N for N in nodes if N.NID not in dormant_nids]
 
-    # those nodes to consider in dismabiguation
-    active = fjc_active + non_fjc
-    # those we can consider dormant.
-    dormant = fjc_dormant
-
-    return active, dormant
+    return active_nodes, dormant_nodes
 
 
 def UCID_PIPE_Object_Builder(concatenated_df):
@@ -499,7 +696,7 @@ def UCID_PIPE_Object_Builder(concatenated_df):
         dict: key = ucid, values = list of objects (UCIDMatch objs)
     """
     
-    print("\nPipe: UCID Object Builder")
+    print("Pipe: UCID Object Builder")
 
     # only care about unique entities (the N_Ucid column will keep track of frequency for us)
     temp_group = concatenated_df[["Cleaned_Entity","ucid", "N_ucids", "docket_source"]].drop_duplicates()
@@ -534,29 +731,37 @@ def UCID_PIPE_Object_Builder(concatenated_df):
     return ucid_map
 
 
-def COURT_PIPE_Object_Builder(Pre_SEL):
+def COURT_PIPE_Object_Builder(Post_UCID, serial_init = 0):
     """build dict of objects grouped by court for court matching and disambiguation
 
     Args:
-        Pre_SEL (panda.DataFrame): DF that has already been through intra-ucid matching and disambiguation
+        Post_UCID (panda.DataFrame): DF that has already been through intra-ucid matching and disambiguation
 
     Returns:
         dict, dict: dictionaries of multi-token entity objects vs. single token entity objects, grouped (keyed) by court
     """
     
-    print("\nPipe: Object Builder")
     # IntraMatch dataframe is built using entity, what it points to after ucid matching, the court, and ucids
-    IM = Pre_SEL[['Cleaned_Entity','Points_To','court','ucid']]
+    IM = Post_UCID[['Cleaned_Entity','Points_To','court','ucid']]
 
     # group the df by the updated entity (points to) and determine how many unique ucids each of those entities is on
     GDF = IM.groupby(["Points_To","court"], as_index=False)['ucid'].nunique()
-    
+    GDF['_Serial_ID'] = range(len(GDF))
+
     print(">> Building Objects")
     # with the grouped data, build the courtmatch objects
     court_map = defaultdict(list)
-    for point_starter, court, n_ucids in tqdm.tqdm([tuple(x) for x in GDF.to_numpy()]):
-        court_map[court].append(JED_Classes.CourtMatch(point_starter, court, n_ucids))
+    for point_starter, court, n_ucids, serial_id in tqdm.tqdm([tuple(x) for x in GDF.to_numpy()]):
+        court_map[court].append(
+            JED_Classes.FreeMatch(name= point_starter,
+                                additional_reprs = [],
+                                n_ucids = n_ucids,
+                                courts= [court],
+                                FJC_NID = None, BA_MAG_ID = None,
+                                serial_id= serial_id)
+        )
     
+
     # split the objects into single token names vs. multitoken names per court
     court_map_single = {}
     court_map_long = {}
@@ -566,7 +771,10 @@ def COURT_PIPE_Object_Builder(Pre_SEL):
 
     print(">> Objects Built")
     
-    return court_map_long, court_map_single
+    serial_init = GDF._Serial_ID.max()
+    serial_init+=1
+    GDF.columns = ['Points_To','court','n_ucids','_Serial_ID']
+    return court_map_long, court_map_single, serial_init, GDF
 
 
 def UCID_PIPE_Build_Remapped_Lookup(new_map, toss_map, concatenated_df):
@@ -581,7 +789,7 @@ def UCID_PIPE_Build_Remapped_Lookup(new_map, toss_map, concatenated_df):
         pandas.DataFrame: Updated dataframe of rows for entity lookup that now have a "points to" column filled if an entity points to another one
     """
 
-    print("\nPipe: Building Remapped DataFrame")
+    print("Pipe: Building Remapped DataFrame")
     print(">>Applying remappings")
     # loop through the objects by ucid grouping
     remapped = []
@@ -661,50 +869,133 @@ def UCID_PIPE_Build_Remapped_Lookup(new_map, toss_map, concatenated_df):
     # finally send the updated data on to court level disambiguation
     return Send_To_CourtMatching
 
-def COURT_PIPE_Build_Remapped_Lookup(court_map, Post_UCID):
-    """after court matching, remap the entities in advance of free matching
-
-    Args:
-        court_map (dict): keys = court, values = list of entity objects in that court
-        Post_UCID (pandas.DataFrame): one row per entity indexed location on a ucid
-
-    Returns:
-        pandas.DataFrame: one row per entity indexed location on a ucid with the remapped entities pointing to their parent entities after court matching
-    """
-
-    # we will loop through a courts objects and for any that are now ineligible (they were mapped to another)
-    # we will create a row of data to track and update their data
-    remapped=[]
+def COURT_PIPE_Build_Remapped_Lookup(court_map, unallocated_remainder, Post_UCID, grouped_df):
+    node_IDs = []
     for court, objs in court_map.items():
-        swapped = [o for o in objs if not o.eligible]
-        # they started out pointing to an entity after ucid matching and now there is an updated pointing to
-        for each in swapped:
-            remapped.append(
-                    {'court':court,
-                    'Points_To':each.name,
-                    'Updated_Points_To': each.POINTS_TO}
-                )
+        for each in objs:
+            node_IDs.append({
+                'court':court,
+                'node_name': each.name, # this was the input points to which became the name
+                'original_SID': each.serial_id,
+                'is_FJC':each.is_FJC,
+                'is_BA_MAG': each.is_BA_MAG,
+                'is_eligible': each.eligible,
+                'is_ambiguous': each.is_ambiguous,
+                'Possible_Pointers': [(o.name, o.serial_id) for o in each.Possible_Pointers],
+                'NID': each.NID,
+                'BA_MAG_ID':each.BA_MAG_ID,
+                'SJID': each.SJID
+            })
 
-    # make as df                
-    REM = pd.DataFrame(remapped)
+    node_IDs = pd.DataFrame(node_IDs)
 
-    print(">> Merging onto Larger DF")
-    RePointed = Post_UCID.merge(REM, how='left', on = ['court','Points_To'])
+    Unallocated_DF = []
+    for each in unallocated_remainder:
+        Unallocated_DF.append({
+            'court': None,
+            'node_name': each.name,
+            'original_SID':each.serial_id,
+            'is_FJC': each.is_FJC,
+            'is_BA_MAG': each.is_BA_MAG,
+            'is_eligible': each.eligible,
+            'is_ambiguous': each.is_ambiguous,
+            'Possible_Pointers': each.Possible_Pointers,
+            'NID': each.NID,
+            'BA_MAG_ID': each.BA_MAG_ID,
+            'SJID': each.SJID
+        })
 
-    # if the entity did not have a new pointer, it is still eligible to be mapped to so fill the repointing with itself
-    RePointed["Updated_Points_To"].fillna(RePointed.Points_To, inplace=True)
+    Unallocated_DF = pd.DataFrame(Unallocated_DF)
 
-    # again determine in a court how many times an entity was prefaced with judgey like terms
-    RePointed['Has_Pref'] = RePointed.Prefix_Categories != "No_Keywords"
-    Blanks = RePointed.groupby(['Updated_Points_To','court'], as_index = False).sum('Has_Pref')
-    Blanks = Blanks[['Updated_Points_To','court','Has_Pref']]
+    ALL_NODE_IDs = pd.concat([node_IDs, Unallocated_DF])
 
-    # determine number of unique ucids
-    Unique_Ucid_Counts = RePointed[['ucid','Cleaned_Entity','Points_To','Updated_Points_To','court']].groupby(
-        ['Updated_Points_To','court'], as_index=False)['ucid'].nunique()
-    # merge the blank counts and ucid counts into one frame
-    Court_DF = Unique_Ucid_Counts.merge(Blanks, how='left', on = ['Updated_Points_To','court'])
+    TCM = build_triple_consonants_map(list(ALL_NODE_IDs.node_name.unique()))
+    ALL_NODE_IDs["Triple_Consonant"] = ALL_NODE_IDs.node_name.map(TCM)
 
+
+    remapping = []
+    for court, objs in court_map.items():
+        for each in objs:
+            remapping.append({
+                'court':court,
+                'node_name_post_ucid': each.name, # this was the input points to which became the name
+                'original_SID': each.serial_id,
+                'Updated_Points_To': each.POINTS_TO,
+                'Updated_Points_To_SID': each.POINTS_TO_SID,
+            })
+
+    REM = pd.DataFrame(remapping)
+
+    node_lookup = REM.merge(
+        ALL_NODE_IDs,
+        how='left',
+        left_on = ['court','Updated_Points_To_SID'],
+        right_on = ['court','original_SID'],
+        suffixes = ('','_endpoint')
+    ).drop('Updated_Points_To_SID', axis=1)
+
+    XWalk_to_Post_UCID = grouped_df.merge(
+        node_lookup[['court','node_name_post_ucid','original_SID','original_SID_endpoint']],
+        how='left',
+        left_on = ['court','Points_To','_Serial_ID'],
+        right_on = ['court','node_name_post_ucid','original_SID']
+    ).drop(['_Serial_ID','node_name_post_ucid'],axis=1)
+
+    ID_Mappings = Post_UCID.merge(
+        XWalk_to_Post_UCID[['Points_To','court','original_SID','original_SID_endpoint']],
+        how = 'left',
+        left_on = ['court','Points_To'],
+        right_on = ['court','Points_To']
+    )
+
+    return ID_Mappings, ALL_NODE_IDs
+# #######
+
+#     # again determine in a court how many times an entity was prefaced with judgey like terms
+#     RePointed['Has_Pref'] = RePointed.Prefix_Categories != "No_Keywords"
+#     Blanks = RePointed.groupby(['Updated_Points_To','court'], as_index = False).sum('Has_Pref')
+#     Blanks = Blanks[['Updated_Points_To','court','Has_Pref']]
+
+#     # determine number of unique ucids
+#     Unique_Ucid_Counts = RePointed[['ucid','Cleaned_Entity','Points_To','Updated_Points_To','court']].groupby(
+#         ['Updated_Points_To','court'], as_index=False)['ucid'].nunique()
+#     # merge the blank counts and ucid counts into one frame
+#     Court_DF = Unique_Ucid_Counts.merge(Blanks, how='left', on = ['Updated_Points_To','court'])
+
+#     # special filter, we need to remove random single token entities that are just initials
+#     # we can only confidently do this on triple consonants since vowels could mean it's a real name like Lee
+#     letters = 'abcdefghijklmnopqrstuvwxyz'
+#     vowels = 'aeiouy'
+#     consonants = ''.join(l for l in letters if l not in vowels)
+#     consearch = re.compile(fr'^[{consonants}]+$', flags=re.I)
+#     conmap = {}
+#     # if it's a triple consonant name, we will ignore it
+#     for each in Court_DF.Updated_Points_To.unique():
+#         if consearch.search(each) and len(each)<=4:
+#             flag = True
+#         else:
+#             flag = False
+#         conmap[each] = flag
+    
+#     # map the check for consonants
+#     Court_DF['Ignore'] = Court_DF.Updated_Points_To.map(conmap)
+
+#     # drop out entities with low frequency, single token, and no prefaced judgey text
+#     Court_DF.loc[(Court_DF.ucid<=3)&
+#             (Court_DF.Updated_Points_To.apply(lambda x: len(x.split())==1))&
+#             (Court_DF.Has_Pref==0), 'Ignore'] = True
+    
+#     # merge together onto the SEL like df
+#     FinPrep = RePointed.merge(
+#         Court_DF[['Updated_Points_To', 'court', 'Ignore']], how = 'left', on = ['Updated_Points_To', 'court'])
+
+#     # drop out the bad flagged rows
+#     FinPrep = FinPrep[~FinPrep.Ignore]
+    
+#     return FinPrep
+
+def build_triple_consonants_map(list_of_names):
+    import re
     # special filter, we need to remove random single token entities that are just initials
     # we can only confidently do this on triple consonants since vowels could mean it's a real name like Lee
     letters = 'abcdefghijklmnopqrstuvwxyz'
@@ -713,169 +1004,262 @@ def COURT_PIPE_Build_Remapped_Lookup(court_map, Post_UCID):
     consearch = re.compile(fr'^[{consonants}]+$', flags=re.I)
     conmap = {}
     # if it's a triple consonant name, we will ignore it
-    for each in Court_DF.Updated_Points_To.unique():
-        if consearch.search(each) and len(each)<=4:
+    for each in list_of_names:
+        if consearch.search(each) and len(each)<4:
             flag = True
         else:
             flag = False
         conmap[each] = flag
     
-    # map the check for consonants
-    Court_DF['Ignore'] = Court_DF.Updated_Points_To.map(conmap)
-
-    # drop out entities with low frequency, single token, and no prefaced judgey text
-    Court_DF.loc[(Court_DF.ucid<=3)&
-            (Court_DF.Updated_Points_To.apply(lambda x: len(x.split())==1))&
-            (Court_DF.Has_Pref==0), 'Ignore'] = True
-    
-    # merge together onto the SEL like df
-    FinPrep = RePointed.merge(
-        Court_DF[['Updated_Points_To', 'court', 'Ignore']], how = 'left', on = ['Updated_Points_To', 'court'])
-
-    # drop out the bad flagged rows
-    FinPrep = FinPrep[~FinPrep.Ignore]
-    
-    return FinPrep
+    return conmap
 
 
-def PIPE_NODE_BUILDER(Post_Court, fjc_active):
-    """Build pool of entity nodes that will be used in free-matching disambiguation
+def FJC_Node_Creator(fjc_active, serial_init):
+    import JED_Globals_public
 
-    Args:
-        Post_Court (pandas.DataFrame): SEL-like df with one row per entity indexed location on a ucid, after court-level disambiguation
-        fjc_active (pandas.DataFrame): FJC demographics dataframe in custom long form
+    # FJC_Nodes = []
+    FJC_Nodes = defaultdict(list)
 
-    Returns:
-        list : list of node objects to be used for final round of pooled disambiguation
-    """
-
-    print("\nPipe: Building Free Match Nodes")
-    # get unique ucid counts for each entity grouped by court
-    nodes = Post_Court.groupby(['Updated_Points_To', 'court'], 
-                           as_index=False)['ucid'].nunique().sort_values('Updated_Points_To')
-    
-    # defaults for the FJC data
-    
-    nid = {}
-    fullnames = {}
-    simple_names = {}
-    earliest_commission = {}
-    latest_termination = {}
-
-    # build FJC data 
+    # FJC df cannot have duplicated NID rows (it shouldnt)
+    # iterate through each and create the nodes
     for index, row in fjc_active.iterrows():
-        key = row['nid']['']
-        earliest_commission[key] = row['Commission Date']['min']
-        latest_termination[key] = row['Termination Date']['max']
-        nid[key] = key
-        fullnames[key] = row['FullName']['']
-        simple_names[key] = row['Simplified Name']['']
+        fjc_nid = row['nid']['']
+        COURTS = row['Courts']['']
 
-    # aggregations on the FJC data
-
-    FJC_Nodes = []
-    for each in fjc_active['nid'].unique():
-        fjc_info = {
-            "Full_Name":fullnames[each],
-            "NID":nid[each],
-            "Earliest_Commission":earliest_commission[each],
-            "Latest_Termination": latest_termination[each]
-        }
-        simple_name = simple_names[each]
-
-        FJC_Nodes.append(JED_Classes.FreeMatch(simple_name,0,[],fjc_info))
-
-    # begin grouping entities together by exact name matches now
-    # court ucid counts can be summed as ucids are mutually exclusive across courts
-    names = {}
-    for name, court, ucids in [tuple(x) for x in nodes.to_numpy()]:
-        if name not in names:
-            names[name] = {'courts':[court], 'N_ucids':ucids}
+        NAME_FORMS = row['Name_Forms']['']
+        if len(NAME_FORMS)==1:
+            cleaned_name = NAME_FORMS[0]
+            additional_reprs = []
         else:
-            names[name]['courts'].append(court)
-            names[name]['N_ucids']+=ucids
+            # the shortest name will be the most "truthlike" name as the FJC brackets indicate
+            # that part of the name is unused (i.e. C[hristian] John Rozolis means the colloquial
+            # name form is C John Rozolis)
+            sorty = sorted(NAME_FORMS, key=lambda x: len(x), reverse=False)
+            cleaned_name = sorty[0]
+            additional_reprs = sorty[1:]
 
-    # now for every name, if the name is multi-tokened, create a node object for matching
-    PC_Nodes = []
-    for name, values in names.items():
-        if len(name.split())==1:
+        if row['nid'][''] in JED_Globals_public.FJC_ADDITIONAL_REPRESENTATIONS:
+            additional_reprs+= JED_Globals_public.FJC_ADDITIONAL_REPRESENTATIONS[row['nid']['']]
+        
+        if type(COURTS)== list:
+            for court in COURTS:
+                FJC_Nodes[court].append( 
+                    JED_Classes.FreeMatch( 
+                        cleaned_name, additional_reprs,
+                        n_ucids = 0, courts = COURTS,FJC_NID = fjc_nid, BA_MAG_ID = None,
+                        serial_id=serial_init
+                        )
+                    )
+                serial_init+=1
+        else:
+            FJC_Nodes['Unallocated'].append( 
+                JED_Classes.FreeMatch( 
+                    cleaned_name, additional_reprs,
+                    n_ucids = 0, courts = [],FJC_NID = fjc_nid, BA_MAG_ID = None,
+                    serial_id=serial_init
+                    )
+                )
+            serial_init+=1
+                
+    return FJC_Nodes, serial_init
+
+def BA_MAG_Node_Creator(ba_mag, serial_init):
+    
+    # BA_MAG_Nodes = []
+    BA_MAG_Nodes = defaultdict(list)
+
+    # ba/mag df cannot have duplicated JUDGE_ID rows (it shouldnt)
+    # iterate through each and create the nodes
+    for index, row in ba_mag.drop_duplicates(["_cleaned_name","JUDGE_ID"]).iterrows():
+        bama_id = row['JUDGE_ID']
+        courts = row['_courts']
+        cleaned_name = row['_cleaned_name']
+        additional_reprs = None
+        
+        if type(courts)== list:
+            for court in courts:
+                BA_MAG_Nodes[court].append( 
+                    JED_Classes.FreeMatch( 
+                        cleaned_name, additional_reprs,
+                        n_ucids = 0, courts = courts, FJC_NID = None, BA_MAG_ID = bama_id,
+                        serial_id= serial_init
+                        )
+                    )
+                serial_init+=1
+        else:
+            BA_MAG_Nodes['Unallocated'].append( 
+                JED_Classes.FreeMatch( 
+                    cleaned_name, additional_reprs,
+                    n_ucids = 0, courts = [], FJC_NID = None, BA_MAG_ID = bama_id,
+                    serial_id= serial_init
+                    )
+                )
+            serial_init+=1
+
+    return BA_MAG_Nodes, serial_init
+
+
+def reduce_ground_truths(NODES):
+    from collections import defaultdict
+    
+    
+    nodes_bamag = defaultdict(list)
+    nodes_fjc = defaultdict(list)
+    
+    for each in [N for N in NODES if N.is_BA_MAG]:
+        nodes_bamag[each.BA_MAG_ID].append(each)
+    for each in [N for N in NODES if N.is_FJC]:
+        nodes_fjc[each.NID].append(each)
+        
+    for bid,bama in nodes_bamag.items():
+        if len(bama) == 1:
             continue
-        PC_Nodes.append(JED_Classes.FreeMatch(name, values['N_ucids'],values['courts']))
+        else:
+            keep = bama[0]
+            maps = bama[1:]
+            for map_it in maps:
+                keep.adopt_courts(map_it)
+                map_it.points_to(keep)
+                
+    for nid,fjcs in nodes_fjc.items():
+        if len(fjcs) == 1:
+            continue
+        else:
+            keep = fjcs[0]
+            maps = fjcs[1:]
+            for map_it in maps:
+                keep.adopt_courts(map_it)
+                map_it.points_to(keep)
+    
+    return NODES
 
-    # finally group the FJC nodes with the docket/extraction nodes
-    Free_Nodes = PC_Nodes+ FJC_Nodes
+def PIPE_NODE_BUILDER(ID_Mappings, ALL_NODE_IDs):
+    Post_Court_UCID_Counts = ID_Mappings.groupby(
+        ['original_SID_endpoint','court'],
+        as_index=False
+    )['ucid'].nunique().sort_values('original_SID_endpoint')
 
-    return Free_Nodes
+    Post_Court_UCID_Counts.columns = ['SID','court','N_UCIDs']
 
+    Nodes_from_dockets = ALL_NODE_IDs[(ALL_NODE_IDs.is_eligible)&
+        (~ALL_NODE_IDs.is_ambiguous)&
+        (~ALL_NODE_IDs.Triple_Consonant)&
+        (ALL_NODE_IDs.node_name.apply(lambda x: len(str(x).split())>1))&
+        (ALL_NODE_IDs.node_name.apply(lambda x: max( [len(tok) for tok in x.split()])>1))]
 
-def PIPE_RePoint_Free_Match(Post_Court, NODES):
-    """After the final round of pooled disambiguation, update entities to point to final mapped parent entities
+    Build_Set = Nodes_from_dockets.merge(
+        Post_Court_UCID_Counts,
+        how='left',
+        left_on = ['court','original_SID'],
+        right_on = ['court','SID']
+    ).drop('SID',axis=1)
+    Build_Set.N_UCIDs.fillna(0, inplace=True)
 
-    Args:
-        Post_Court (pandas.DataFrame): one row per entity indexed location on a ucid, pre-SEL df
-        NODES (list): list of entity objects that have gone through disambiguation
+    ALL_NODE_IDs.loc[(~ALL_NODE_IDs.original_SID.isin(Build_Set.original_SID)), "is_eligible"] = False
 
-    Returns:
-        pandas.DataFrame: remapped column added post disambiguation
-    """
-    print("\nPipe: Repointing entities after free match")
-    # again, if the entity was ruled ineligible during free match that means it was mapped onto another entity
-    # we will make df rows of these remappings to merge onto the prior dataframe
-    remapped=[]
-    for obj in [o for o in NODES if not o.eligible]:
-        remapped.append(
-                {'Updated_Points_To':obj.name,
-                'Final_Pointer': obj.POINTS_TO,
-                'is_FJC':obj.is_FJC,
-                'NID':obj.NID}
+    # 1. make a node for every node in the Build Set
+    NODES = []
+
+    for index, row in Build_Set.iterrows():
+        additional_reprs = None
+        if row['NID']:
+            additional_reprs = JG.FJC_ADDITIONAL_REPRESENTATIONS.get(row['NID'])
+        
+        
+        NODES.append(
+            JED_Classes.FreeMatch(
+                name= row['node_name'], additional_reprs=additional_reprs,
+                n_ucids = row['N_UCIDs'], courts = [row['court']], 
+                FJC_NID= row['NID'], BA_MAG_ID= row['BA_MAG_ID'],
+                serial_id= row['original_SID']
             )
-    
-    REM = pd.DataFrame(remapped)
-    
-    print(">> Merging onto Larger DF")
-    RePointed = Post_Court.merge(REM, how='left', on = ['Updated_Points_To'])
+        )
 
-    # if it does not point to another entity, it is the parent entity, fill with itself
-    RePointed["Final_Pointer"].fillna(RePointed.Updated_Points_To, inplace=True)
-    # if it was not an FJC node, this would be null
-    RePointed["is_FJC"].fillna(False, inplace=True)
+    # first point all ba_mag at each other appropriately
+    # second point any ba mag at nid if applicable
+    # finally, point all nid at each other
 
-    # header data's prefix categories would be null, at this point we label them as Nondescript
-    RePointed.loc[
-        RePointed.Prefix_Categories.isin(['assigned_judge', 'referred_judges']), 'Prefix_Categories'] = 'Nondescript_Judge'
-    
-    return RePointed
 
-def PIPE_LABEL_AND_BUILD(Fin_Match, NODES):
-    """ After all disambiguation, build the final JEL and run the labelling algorithm over the entities
+    return NODES, ALL_NODE_IDs
 
-    Args:
-        Fin_Match (pandas.DataFrame): pre-sel df row with one row per entity indexed location on a ucid
-        NODES (list): list of disambiguated nodes
 
-    Returns:
-        pandas.DataFrame, dict: JEL dataframe of defined judges, lookup map of the SJID and node names
-    """
-    print("\nPipe: Generating Labels and SJIDs")
-    # get a final count of unique ucids per entity using the parent entity (final pointer) labels
-    temp = Fin_Match.groupby(['Final_Pointer', 'Prefix_Categories'], as_index=False)['ucid'].nunique('ucid')
+def PIPE_REPOINT_Free_Match(ALL_NODES, ID_Mappings, ALL_NODE_IDs):
+    input_lookup = []
+    for node in ALL_NODES:
+        input_lookup.append({
+            'node_name': node.name, # this was the input points to which became the name
+            'original_SID': node.serial_id,
+            'is_FJC':node.is_FJC,
+            'is_BA_MAG': node.is_BA_MAG,
+            'is_eligible': node.eligible,
+            'is_ambiguous': node.is_ambiguous,
+            'Possible_Pointers': [(o.name, o.serial_id) for o in node.Possible_Pointers],
+            'NID': node.NID,
+            'BA_MAG_ID':node.BA_MAG_ID,
+            'SJID': node.SJID
+            
+        })
+    IL_NODES = pd.DataFrame(input_lookup)
+
+    input_remap = []
+    for node in ALL_NODES:
+        input_remap.append({
+            "original_name":node.name,
+            "original_sid": node.serial_id,
+            "points_to_name": node.POINTS_TO,
+            "points_to_sid": node.POINTS_TO_SID
+        })
+
+    IREM = pd.DataFrame(input_remap)
+
+    # inputs_mapped = IREM.merge(
+    #     IL_NODES,
+    #     how='left',
+    #     left_on = ['points_to_sid'],
+    #     right_on = ["original_SID"]
+    # ).drop(["original_SID"], axis=1)
+
+    PCID_Mappings = ID_Mappings.merge(
+        IREM[['original_sid','points_to_sid']],
+        how='left',
+        left_on = 'original_SID_endpoint',
+        right_on = 'original_sid'
+    ).drop("original_sid",axis=1)
+    PCID_Mappings.points_to_sid.fillna(PCID_Mappings.original_SID_endpoint, inplace=True)
+
+    # combine original nodes that didnt enter post court + the post court nodes
+    FINAL_NODE_LOOKUP = pd.concat([
+        ALL_NODE_IDs[~ALL_NODE_IDs.original_SID.isin(IL_NODES.original_SID)],
+        IL_NODES
+    ])
+
+    return PCID_Mappings, FINAL_NODE_LOOKUP, IREM
+
+def PIPE_LABEL_AND_BUILD(PCID_Mappings, FINAL_NODE_LOOKUP, IREM):
+    PCID_Mappings.loc[
+        PCID_Mappings.Prefix_Categories.isin(
+            ['assigned_judge', 'referred_judges']
+        ), 'Prefix_Categories'] = 'Nondescript_Judge'
+
+    temp = PCID_Mappings.groupby(['points_to_sid','Prefix_Categories'], as_index=False)['ucid'].nunique('ucid')
 
     # for each parent entity, determine the pretext category counts for judgey like terms
-    Prefs = temp.set_index(['Final_Pointer','Prefix_Categories']).unstack('Prefix_Categories')
+    Prefs = temp.set_index(['points_to_sid','Prefix_Categories']).unstack('Prefix_Categories')
     # fill nulls with 0
     Prefs.fillna(0,inplace=True)
     Prefs.reset_index(inplace=True)
 
     # get unique ucid counts for header appearances
-    Header_Counts = Fin_Match[Fin_Match.docket_source!='line_entry'].groupby("Final_Pointer", as_index=False)['ucid'].nunique()
-    Header_Counts.columns = ['Final_Pointer','Head_UCIDs']
+    Header_Counts = PCID_Mappings[PCID_Mappings.docket_source!='line_entry'].groupby(
+        "points_to_sid", as_index=False)['ucid'].nunique()
+    Header_Counts.columns = ['points_to_sid','Head_UCIDs']
     # get toal unique ucid counts
-    Total_Counts = Fin_Match.groupby("Final_Pointer", as_index=False)['ucid'].nunique()
-    Total_Counts.columns = ['Final_Pointer','Total_UCIDs']
+    Total_Counts = PCID_Mappings.groupby("points_to_sid", as_index=False)['ucid'].nunique()
+    Total_Counts.columns = ['points_to_sid','Total_UCIDs']
 
     # create the maps from entities to counts
-    TC = {i:j for i,j in zip(Total_Counts.Final_Pointer.values, Total_Counts.Total_UCIDs.values)}
-    HC = {i:j for i,j in zip(Header_Counts.Final_Pointer.values, Header_Counts.Head_UCIDs.values)}
+    TC = {i:j for i,j in zip(Total_Counts.points_to_sid.values, Total_Counts.Total_UCIDs.values)}
+    HC = {i:j for i,j in zip(Header_Counts.points_to_sid.values, Header_Counts.Head_UCIDs.values)}
 
     preffy_dict = {}
     # pref columns[1:] are all of the mutually exclusive labels
@@ -886,70 +1270,109 @@ def PIPE_LABEL_AND_BUILD(Fin_Match, NODES):
         # dict key is entity, value is a dict of columns + value where col is the actual column label
         preffy_dict[each[0]] = {col:val for col,val in zip(collabs, each[1:])}
 
-    # create the Algorithmic Mapping objects from the disambiguated nodes
     AMS = []
     # for every eligible parent entity
-    for o in [o for o in NODES if o.eligible]:
+    for index, row in FINAL_NODE_LOOKUP[FINAL_NODE_LOOKUP.is_eligible].iterrows():
         # defaults are zeros
         pref = {}
         hucid = 0
         tucid = 0
 
-        if o.name in preffy_dict:
-            pref = preffy_dict[o.name]
-        if o.name in HC:
-            hucid = HC[o.name]
-        if o.name in TC:
-            tucid = TC[o.name]
+        sid = row["original_SID"]
+        
+        if sid in preffy_dict:
+            pref = preffy_dict[sid]
+        if sid in HC:
+            hucid = HC[sid]
+        if sid in TC:
+            tucid = TC[sid]
 
-        if o.is_FJC:
-            FJC_Info = {
-                "Full_Name": o.Full_Name,
-                "NID": o.NID,
-                "Earliest_Commission": o.Earliest_Commission,
-                "Latest_Termination": o.Latest_Termination}
+        if row['is_FJC']:
+            FJC_Info = {"NID": row["NID"]}
         else:
             FJC_Info = {}
-
+            
+        if row['is_BA_MAG']:
+            BA_MAG_Info = {"BA_MAG_ID": row["BA_MAG_ID"]}
+        else:
+            BA_MAG_Info = {}
+            
         # make the object using our default information
-        AMS.append(JED_Classes.Algorithmic_Mapping(
-            o.name, o.is_FJC, FJC_Info, pref, hucid, tucid
+        AMS.append(
+            JED_Classes.Algorithmic_Mapping(
+                row['node_name'], row['original_SID'],
+                row["is_FJC"], FJC_Info,
+                row["is_BA_MAG"], BA_MAG_Info,
+                pref, hucid, tucid
             ))
-    
+
     # instant rejection for entities with less than 3 unique ucids is not fjc and is a single token name
-    bads = [o for o in AMS if (o.Tot_UCIDs<=3 and not o.is_FJC and len(o.name.split())==1) or (len(o.name.split())==1)]
-    # any single token name leftover is also tossed
-    bads += [o for o in AMS if o not in bads and len(o.tokens_wo_suff[-1])==1]
-    # good nodes are those that arent bad
+    bads = []
+    for o in AMS:
+        if o.Tot_UCIDs<=3:
+            if not o.is_FJC and not o.is_BA_MAG and len(o.tokens_wo_suff)==1:
+                bads.append(o)
+        if len(o.tokens_wo_suff)==1 or len(o.base_tokens)==1:
+            if o not in bads:
+                bads.append(o)
+
     goods = [o for o in AMS if o not in bads]
-    
+
     # for every good node, run the labelling algorithm
     for obj in goods:
         obj.Label_Algorithm()
-        
+
     # once a label has been generated...
     # keep any node that was not denied, reject otherwise
     kept = [o for o in goods if 'deny' not in o.SCALES_Guess]
     rejected = [o for o in goods if 'deny' in o.SCALES_Guess]
-    
+
     # now generate the SJIDs for the kept entities
     for i, obj in enumerate(kept):
         idn = str(i).zfill(6)
         obj.set_SCALES_JID(f"SJ{idn}")
-
+    
     # mark the remaining entities as inconclusive
     for obj in rejected:
         obj.set_SCALES_JID("Inconclusive")
-        
+
     # now for each of those entities, build a mapping of the SJIDs and Names
     SJID_MAP = {}
     for each in rejected + kept:
-        SJID_MAP[each.name] = each.SJID
-    
-    # Build the JEL using custom object function
+        SJID_MAP[each.serial_id] = each.SJID
+
+    # should not see "t o" here now
     JEL = pd.DataFrame([o.JEL_row() for o in kept])
-    
-    return JEL, SJID_MAP
+
+    sid2JEL = {sid:sjid for sid,sjid in JEL[['serial_id','SJID']].to_numpy()}
+    PCID_Mappings['SJID'] = PCID_Mappings.points_to_sid.map(sid2JEL)
+
+    additional_maps = {start:end for start, end in IREM[['original_sid','points_to_sid']].to_numpy()}
+
+    remaining_ambiguities = FINAL_NODE_LOOKUP[FINAL_NODE_LOOKUP.is_ambiguous]
+    ambiguous_maps = {}
+    for index, row in remaining_ambiguities.iterrows():
+        sid = row['original_SID']
+        options = []
+        for each in row['Possible_Pointers']:
+            checksid = each[1]
+            if checksid in sid2JEL:
+                options.append(sid2JEL[checksid])
+            else:
+                checksid = additional_maps[checksid]
+                if checksid in sid2JEL:
+                    options.append(sid2JEL[checksid])
+        if options:
+            ambiguous_maps[sid] = options
+
+    PCID_Mappings["Ambiguous_SJIDS"] = None
+    PCID_Mappings.loc[PCID_Mappings.SJID.isna(),"Ambiguous_SJIDS"] = PCID_Mappings.points_to_sid.map(ambiguous_maps)
+    PCID_Mappings.loc[~PCID_Mappings.Ambiguous_SJIDS.isna(),"SJID"] = "Ambiguous"
+    PCID_Mappings.SJID.fillna("Inconclusive", inplace= True)
+
+    JEL.drop("serial_id",axis=1, inplace=True)
+
+    return JEL, PCID_Mappings
 
 
 import os
@@ -1329,46 +1752,104 @@ def PIPE_Update_Final_Repoint(Post_Court, FIN_NODES):
     
     return RePointed
 
-def PIPE_UPDATE_NEW_LABELS_AND_BUILD(readySEL, RPDF, oldJEL, FIN_NODES):
-    """After a second disambiguation routine, update the entity labels and build the latest SEL and JEL data outputs
+def reduce_ground_truths_update(NODES: list, oldJEL: pd.DataFrame):
+    """After court disambiguation it is possible multiple copies of a ground truth entity exist
+    (for example a judge that operated in the Eastern and Western District of KY would be in each courts
+    list of nodes). In this function, we collapse those into one ground truth reference
 
     Args:
-        readySEL (pandas.DataFrame): DF of existing SEL labeled entities on dockets that will be remapped or updated
-        RPDF (pandas.DataFrame): DF of newest SEL labeled entities on dockets that have not been put into files yet
-        oldJEL (pandas.DataFrame): DF of existing JEL
-        FIN_NODES (list): final list of nodes (IntraMatch super objects) after disambiguation
+        NODES (list): list of IntraMatch objects 
+        oldJEL (pd.DataFrame): prior identified ground truth entities if we have an existing JEL
 
     Returns:
-        [type]: [description]
+        list: the same list of IntraMatch objects plus JEL rows if applicable, now mapped to each other
     """
-    ## PREPARE DOCKET PREFIX DATA
-    ##############################
-    readySEL.rename(columns = {'Updated_Points_To':'Final_Pointer'}, inplace = True)
-    COUNT_DF = pd.concat(
-        [
-            RPDF[["docket_source","Final_Pointer","Prefix_Categories","ucid"]],
-            readySEL[["docket_source","Final_Pointer","Prefix_Categories","ucid"]]
-        ])
+    # create prior ground truth nodes
+    JEL_objs = []
+    jelsid = 0
+    for index, row in oldJEL.iterrows():
+        # we iterate the serial IDs into the negatives since the new unknown ones are positive
+        jelsid-=1
+        alternates = None
+        # if there is an NID, confirm there are no additional marital names or other variants for the entities
+        if not pd.isnull(row['NID']):
+            alternates = JG.FJC_ADDITIONAL_REPRESENTATIONS.get(row['NID'])
 
-    # get a final count of unique ucids per entity using the parent entity (final pointer) labels
-    temp = COUNT_DF.groupby(['Final_Pointer', 'Prefix_Categories'], as_index=False)['ucid'].nunique('ucid')
+        JEL_objs.append(
+            JED_Classes.FreeMatch(
+            row['name'], alternates, 0, courts=[],
+            FJC_NID= row['NID'], BA_MAG_ID=row['BA_MAG_ID'], serial_id=jelsid, SJID = row['SJID']
+            )
+        )
 
+    from collections import defaultdict
+
+    # create all of the nodes from our ground truth sources
+    # it doesnt matter if they already existed, they will be reduced or figured out later
+    nodes_bamag = defaultdict(list)
+    nodes_fjc = defaultdict(list)
+
+    for each in JEL_objs:
+        if each.is_FJC:
+            nodes_fjc[each.NID].append(each)
+        elif each.is_BA_MAG:
+            nodes_bamag[each.BA_MAG_ID].append(each)
+        else:
+            continue
+    
+    # combine the input nodes that are BAMAG with the ground truth ones, same for FJC
+    for each in [N for N in NODES if N.is_BA_MAG]:
+        nodes_bamag[each.BA_MAG_ID].append(each)
+    for each in [N for N in NODES if N.is_FJC]:
+        nodes_fjc[each.NID].append(each)
+
+    # this dictionary was keyed by unique identifier
+    # for each unique judge, there is a list of duplicate entities
+    # reduce them all into one object now
+    for bid,bama in nodes_bamag.items():
+        if len(bama) == 1:
+            continue
+        else:
+            keep = bama[0]
+            maps = bama[1:]
+            for map_it in maps:
+                keep.adopt_courts(map_it)
+                map_it.points_to(keep)
+
+    # exact same concept for the FJC judges
+    for nid,fjcs in nodes_fjc.items():
+        if len(fjcs) == 1:
+            continue
+        else:
+            keep = fjcs[0]
+            maps = fjcs[1:]
+            for map_it in maps:
+                keep.adopt_courts(map_it)
+                map_it.points_to(keep)
+                
+    return NODES + JEL_objs
+
+
+def assemble_meta_data(PCID: pd.DataFrame, old_SJID_Data: list, priors_map: dict):
+    """This function runs after the final layer of disambiguation. The function assembled metadata
+    for all of the input rows and prior tagged SJIDs that could be re-labelled algorithmically.
+    The metadata includes UCID counts and prefix counts for the entity appearances
+
+    Args:
+        PCID (pd.DataFrame): extracted entities dataframe with pointers after disambiguation
+        old_SJID_Data (list): list of ingested data on prior-tagged ucids including their prefixes and ucids
+        priors_map (dict): a dictionary mapping the prior SJIDs to their node serial_ids
+
+    Returns:
+        dict, dict, dict: three dictionaries keyed by their node serial_ids - prefix counts, header ucid counts, and total ucid counts
+    """
+    temp = PCID.groupby(['points_to_sid','Prefix_Categories'], as_index=False)['ucid'].nunique('ucid')
+    
     # for each parent entity, determine the pretext category counts for judgey like terms
-    Prefs = temp.set_index(['Final_Pointer','Prefix_Categories']).unstack('Prefix_Categories')
+    Prefs = temp.set_index(['points_to_sid','Prefix_Categories']).unstack('Prefix_Categories')
     # fill nulls with 0
     Prefs.fillna(0,inplace=True)
     Prefs.reset_index(inplace=True)
-
-    # get unique ucid counts for header appearances
-    Header_Counts = COUNT_DF[COUNT_DF.docket_source!='line_entry'].groupby("Final_Pointer", as_index=False)['ucid'].nunique()
-    Header_Counts.columns = ['Final_Pointer','Head_UCIDs']
-    # get toal unique ucid counts
-    Total_Counts = COUNT_DF.groupby("Final_Pointer", as_index=False)['ucid'].nunique()
-    Total_Counts.columns = ['Final_Pointer','Total_UCIDs']
-
-    # create the maps from entities to counts
-    TC = {i:j for i,j in zip(Total_Counts.Final_Pointer.values, Total_Counts.Total_UCIDs.values)}
-    HC = {i:j for i,j in zip(Header_Counts.Final_Pointer.values, Header_Counts.Head_UCIDs.values)}
 
     preffy_dict = {}
     # pref columns[1:] are all of the mutually exclusive labels
@@ -1378,240 +1859,320 @@ def PIPE_UPDATE_NEW_LABELS_AND_BUILD(readySEL, RPDF, oldJEL, FIN_NODES):
         # for each entity with pretext counts
         # dict key is entity, value is a dict of columns + value where col is the actual column label
         preffy_dict[each[0]] = {col:val for col,val in zip(collabs, each[1:])}
+        
+    # get unique ucid counts for header appearances
+    Header_Counts = PCID[PCID.docket_source!='line_entry'].groupby(
+        "points_to_sid", as_index=False)['ucid'].nunique()
+    Header_Counts.columns = ['points_to_sid','Head_UCIDs']
+    # get toal unique ucid counts
+    Total_Counts = PCID.groupby("points_to_sid", as_index=False)['ucid'].nunique()
+    Total_Counts.columns = ['points_to_sid','Total_UCIDs']
 
+    # create the maps from entities to counts
+    TC = {i:j for i,j in zip(Total_Counts.points_to_sid.values, Total_Counts.Total_UCIDs.values)}
+    HC = {i:j for i,j in zip(Header_Counts.points_to_sid.values, Header_Counts.Head_UCIDs.values)}
+    
+    OSD = pd.DataFrame(old_SJID_Data)
+    
+    OSD_temp = OSD.groupby(['SJID','Prefix_Categories'], as_index=False)['ucid'].nunique('ucid')
 
-    ## Build Viable Nodes
-    ##############################
-    # create the Algorithmic Mapping objects from the disambiguated nodes
+    OSD_Prefs = OSD_temp.set_index(['SJID','Prefix_Categories']).unstack('Prefix_Categories')
+    # fill nulls with 0
+    OSD_Prefs.fillna(0,inplace=True)
+    OSD_Prefs.reset_index(inplace=True)
+
+    OSD_preffy_dict = {}
+    # pref columns[1:] are all of the mutually exclusive labels
+    # the column is a multi-index, so the label is col[1] 
+    collabs = [col[1] for col in OSD_Prefs.columns[1:]]
+    for each in [tuple(x) for x in OSD_Prefs.to_numpy()]:
+        # for each entity with pretext counts
+        # dict key is entity, value is a dict of columns + value where col is the actual column label
+        dkey = priors_map[each[0]]
+        OSD_preffy_dict[dkey] = {col:val for col,val in zip(collabs, each[1:])}
+    
+    # get unique ucid counts for header appearances
+    OSD_Header_Counts = OSD[OSD.docket_source!='line_entry'].groupby(
+        "SJID", as_index=False)['ucid'].nunique()
+    OSD_Header_Counts.columns = ['SJID','Head_UCIDs']
+    # get toal unique ucid counts
+    OSD_Total_Counts = OSD.groupby("SJID", as_index=False)['ucid'].nunique()
+    OSD_Total_Counts.columns = ['SJID','Total_UCIDs']
+
+    # create the maps from entities to counts
+    OSD_TC = {priors_map[i]:j for i,j in zip(OSD_Total_Counts.SJID.values, OSD_Total_Counts.Total_UCIDs.values)}
+    OSD_HC = {priors_map[i]:j for i,j in zip(OSD_Header_Counts.SJID.values, OSD_Header_Counts.Head_UCIDs.values)}
+    
+    # assemble prefixes
+    FIN_PREFFY = {}
+    for key, dict_vals in preffy_dict.items():
+        FIN_PREFFY[key] = dict_vals
+
+    for key, dict_vals in OSD_preffy_dict.items():
+        if key in FIN_PREFFY:
+            for vkey, val in dict_vals.items():
+                FIN_PREFFY[key][vkey]+=val
+        else:
+            FIN_PREFFY[key] = dict_vals
+
+    # assemble total UCID counts per id
+    FIN_TC = {}
+    for key, vals in TC.items():
+        FIN_TC[key] = vals
+
+    for key, vals in OSD_TC.items():
+        if key in FIN_TC:       
+            FIN_TC[key]+=vals
+        else:
+            FIN_TC[key] = vals
+
+    # assemble header UCID counts per id
+    FIN_HC = {}
+    for key, vals in HC.items():
+        FIN_HC[key] = vals
+
+    for key, vals in OSD_HC.items():
+        if key in FIN_HC:       
+            FIN_HC[key]+=vals
+        else:
+            FIN_HC[key] = vals
+    
+    return FIN_PREFFY, FIN_TC, FIN_HC
+
+def PIPE_UPDATE_Assign_and_ReLabel(PCID: pd.DataFrame, FIN_LOOKUP: pd.DataFrame, IREM: pd.DataFrame, oldJEL: pd.DataFrame, old_SJID_Data: list):
+    """GIven a post disambiguation dataframe and the node mapping lookups, relabel and re-guess the SJID values in the final cleanup steps here
+
+    Args:
+        PCID (pd.DataFrame): extracted entities dataframe with pointers after disambiguation
+        FIN_LOOKUP (pd.DataFrame): Lookup df of all node serial IDs and who they eventually point to as their parent entity
+        IREM (pd.DataFrame): intermediate lookup from court to freematch disambiguation
+        oldJEL (pd.DataFrame): existing DF of known judge entities prior to this update
+        old_SJID_Data (list): list of ingested data on prior-tagged ucids including their prefixes and ucids
+
+    Returns:
+        panda.DataFrame, pandas.DataFrame: massive SEL-ready dataframe with final disambiguation tags and labels; updated JEL df with newly identified judges
+    """
+    # header extractions need to be remapped so their prefixes are nondescript
+    PCID.loc[PCID.Prefix_Categories.isin(['assigned_judge', 'referred_judges']), 'Prefix_Categories'] = 'Nondescript_Judge'
+
+    # map the serial IDs to their SJIDs
+    SJID_map = {k:v for k,v in FIN_LOOKUP[['original_SID','SJID']].drop_duplicates().to_numpy()}
+    # apply
+    PCID['SJID'] = PCID.points_to_sid.map(SJID_map)
+    
+    # generate a lookup of prior SJID tags based on Node serial IDs
+    priors = FIN_LOOKUP[["SJID","original_SID","is_eligible"]]
+    priors = priors[~priors.SJID.isna()]
+    priors = priors[priors.is_eligible]
+    priors_map = {k:v for k,v in priors[['SJID','original_SID']].to_numpy()}
+    
+    # given the post extraction data, assemble lookups for the metadat per entity (prefix counts, ucid counts)
+    FIN_PREFFY, FIN_TC, FIN_HC = assemble_meta_data(PCID, old_SJID_Data, priors_map)
+    
+    # create a list of objects that will be pushed through the labelling algorithm to determine if new SJIDs need to be created
     AMS = []
     # for every eligible parent entity
-    for o in [o for o in FIN_NODES if o.eligible]:
+    for index, row in FIN_LOOKUP[FIN_LOOKUP.is_eligible].iterrows():
         # defaults are zeros
         pref = {}
         hucid = 0
         tucid = 0
 
-        if o.name in preffy_dict:
-            pref = preffy_dict[o.name]
-        if o.name in HC:
-            hucid = HC[o.name]
-        if o.name in TC:
-            tucid = TC[o.name]
+        sid = row["original_SID"]
+        # pull the metadata by serial node identifier
+        if sid in FIN_PREFFY:
+            pref = FIN_PREFFY[sid]
+        if sid in FIN_HC:
+            hucid = FIN_HC[sid]
+        if sid in FIN_TC:
+            tucid = FIN_TC[sid]
 
-        if o.is_FJC:
-            FJC_Info = {
-                "Full_Name": o.Full_Name,
-                "NID": o.NID,
-                "Earliest_Commission": o.Earliest_Commission,
-                "Latest_Termination": o.Latest_Termination}
+        # pull ground truth labels if applicable
+        if row['is_FJC']:
+            FJC_Info = {"NID": row["NID"]}
         else:
             FJC_Info = {}
 
+        if row['is_BA_MAG']:
+            BA_MAG_Info = {"BA_MAG_ID": row["BA_MAG_ID"]}
+        else:
+            BA_MAG_Info = {}
+
         # make the object using our default information
-        AMS.append(JED_Classes.Algorithmic_Mapping(
-            o.name, o.is_FJC, FJC_Info, pref, hucid, tucid, o.SJID
+        AMS.append(
+            JED_Classes.Algorithmic_Mapping(
+                row['node_name'], row['original_SID'],
+                row["is_FJC"], FJC_Info,
+                row["is_BA_MAG"], BA_MAG_Info,
+                pref, hucid, tucid, Prior_SJID=row['SJID']
             ))
 
     # instant rejection for entities with less than 3 unique ucids is not fjc and is a single token name
-    bads = [o for o in AMS if (o.Tot_UCIDs<=3 and not o.is_FJC and len(o.name.split())==1) or (len(o.name.split())==1)]
-    # any single token name leftover is also tossed
-    bads += [o for o in AMS if o not in bads and len(o.tokens_wo_suff[-1])==1]
-    # good nodes are those that arent bad
+    bads = []
+    for o in AMS:
+        if o.Tot_UCIDs<=3:
+            if not o.is_FJC and not o.is_BA_MAG and len(o.tokens_wo_suff)==1:
+                bads.append(o)
+        if len(o.tokens_wo_suff)==1 or len(o.base_tokens)==1:
+            if o not in bads:
+                bads.append(o)
+
     goods = [o for o in AMS if o not in bads]
 
-
-    ## Label Nodes
-    ##############################
     # for every good node, run the labelling algorithm
     for obj in goods:
         obj.Label_Algorithm()
 
+    # once a label has been generated...
+    # keep any node that was not denied, reject otherwise
     kept = [o for o in goods if 'deny' not in o.SCALES_Guess]
     rejected = [o for o in goods if 'deny' in o.SCALES_Guess]
-
-    # for every kept node, we want a dataframe of its data
-    guesses = pd.DataFrame([o.build_row(update=True) for o in kept])
-
-    # separate into previously identified and new entities
-    needs_SJID = [o for o in kept if not o.Prior_SJID]
-    needs_Confirmation = [o for o in kept if o.Prior_SJID]
-
-    # now generate the SJIDs for the newest entities
-
-    # identify the next available SJID to assign
-    next_SJID = max([int(sj.split("SJ")[1]) for sj in oldJEL.SJID.unique()])+1
-    for obj in needs_SJID:
-        idn = str(next_SJID).zfill(6)
-        next_SJID+=1
-        obj.set_SCALES_JID(f"SJ{idn}")
-
-    # for the existing known entities, keep their original SJIDs
-    for obj in needs_Confirmation:
-        obj.set_SCALES_JID(obj.Prior_SJID)
 
     # mark the remaining entities as inconclusive
     for obj in rejected:
         obj.set_SCALES_JID("Inconclusive")
 
-    # generate the pretty name attribute for final kept entities (will be placed in JEL data)
+    max_prior_sjid = max([int(oj.split('SJ')[1]) for oj in oldJEL.SJID.unique()])
+
+    # now generate the SJIDs for the kept entities
+    restart = max_prior_sjid+1
     for obj in kept:
-        obj.prettify_name()
-
-    ## Build Updated JEL
-    ############################## 
-    # Build the JEL using custom object function
-    
-    # new JEL df
-    newJEL = pd.DataFrame([o.JEL_row() for o in kept])
-
-    JEL_Data = {}
-    # make sure we didn't miss any rows from the old one, using an SJID mapping to do so
-    for index, row in oldJEL.iterrows():
-        sjid = row["SJID"]
-        JEL_Data[sjid] = dict(row)
-
-    for index, row in newJEL[
-        ['name', 'Presentable_Name', 'SJID', 'SCALES_Guess', 'Head_UCIDs','Tot_UCIDs', 'Full_Name', 'NID']].iterrows():
-
-        sjid = row["SJID"]
-        new = dict(row)
-        new['SCALES_Judge_Label'] = new['SCALES_Guess']
-        new.pop('SCALES_Guess')
-
-        # for the updated guesses in the JEL, make sure we update the entity labels appropriately based on the sample we used. Usually this will just mean Magistrates are upgraded to FJC Judges
-        if sjid in JEL_Data:
-            old = JEL_Data[sjid]
-            if old["SCALES_Judge_Label"] != new["SCALES_Judge_Label"]:
-                if new["SCALES_Judge_Label"] == "FJC Judge":
-                    JU.log_message(f'Updating: {old["name"]} \t|Prior: {old["SCALES_Judge_Label"]}\t|New: {new["SCALES_Judge_Label"]}')
-                    JEL_Data[sjid] = new
-                    JEL_Data[sjid] = {}
-                else:
-                    # save the old jel row
-                    continue
-            else:
-                # save the old jel row
-                continue
+        if pd.isna(obj.Prior_SJID):
+            idn = str(restart).zfill(6)
+            obj.set_SCALES_JID(f"SJ{idn}")
+            restart+=1
         else:
-            JU.log_message(f"New Judge: {new['name']} \t|New: {new['SCALES_Judge_Label']}")
-            JEL_Data[sjid] = new
+            obj.set_SCALES_JID(obj.Prior_SJID)
 
-    # final updated JEL
-    Updated_JEL = pd.DataFrame(JEL_Data.values())
+    # now for each of those entities, build a mapping of the SJIDs and Names
+    SJID_MAP = {}
+    for each in rejected + kept:
+        SJID_MAP[each.serial_id] = each.SJID
+
+    # create an updated JEL dataframe
+    newJEL = pd.DataFrame([o.JEL_row() for o in kept])
+    sid2JEL = {sid:sjid for sid,sjid in newJEL[['serial_id','SJID']].to_numpy()}
+    PCID['Updated_SJID'] = PCID.points_to_sid.map(sid2JEL)
+    PCID['SJID'].fillna(PCID.Updated_SJID, inplace=True)
+    PCID.drop('Updated_SJID',axis=1, inplace=True)
+
+    additional_maps = {start:end for start, end in IREM[['original_sid','points_to_sid']].to_numpy()}
+    # now reconcile the rows that had ambiguous labels so they at least point to the SJIDs they could be ambiguously tied to
+    remaining_ambiguities = FIN_LOOKUP[FIN_LOOKUP.is_ambiguous]
+    ambiguous_maps = {}
+    for index, row in remaining_ambiguities.iterrows():
+        sid = row['original_SID']
+        options = []
+        for each in row['Possible_Pointers']:
+            checksid = each[1]
+            if checksid in sid2JEL:
+                options.append(sid2JEL[checksid])
+            else:
+                checksid = additional_maps[checksid]
+                if checksid in sid2JEL:
+                    options.append(sid2JEL[checksid])
+        if options:
+            ambiguous_maps[sid] = options
+
+    PCID["Ambiguous_SJIDS"] = None
+    PCID.loc[PCID.SJID.isna(),"Ambiguous_SJIDS"] = PCID.points_to_sid.map(ambiguous_maps)
+    PCID.loc[~PCID.Ambiguous_SJIDS.isna(),"SJID"] = "Ambiguous"
+    PCID.SJID.fillna("Inconclusive", inplace= True)
+
+    PCID[~PCID.Ambiguous_SJIDS.isna()]
     
-    # return the new JEL and SEL ready for remapping
-    return readySEL, Updated_JEL
+    # drop the column we no longer need
+    newJEL.drop("serial_id",axis=1, inplace=True)
+    
+    if any(i not in newJEL.SJID.unique() for i in oldJEL.SJID.unique()):
+        print("ERROR: LOST TRACK OF AN OLD SJID SOMEWHERE")
+    
+    # now create the newest version of our JEL
+    check = newJEL.merge(oldJEL[['SJID','SCALES_Judge_Label','is_FJC','is_BA_MAG']],
+            how = 'left', left_on = ['SJID'], right_on = ['SJID'],
+            suffixes=['','_PRIOR'])
+    # if an old SJID has a new guess, this is the rank order in which the new guess can supersede the old one
+    # ie if the old guess was nondescript and the new one is Judicial Actor, it remains nondescript
+    rank_order = [
+        'FJC Judge', 'BA-MAG Judge','District_Judge','Magistrate_Judge', 'Bankruptcy_Judge',
+        'Nondescript_Judge', 'Judicial_Actor', 'Maintain Prior JEL']
+    # determine if any labels need to be changed
+    for index, row in check.iterrows():
+        prior = row['SCALES_Judge_Label']
+        update = row['SCALES_Guess']
+        fin_guess =''
+        if pd.isna(prior):
+            fin_guess = update
+        elif prior!=update:
+            ro_prior = rank_order.index(prior)
+            ro_update = rank_order.index(update)
+            fin_guess = rank_order[min([ro_prior, ro_update])]
+        else:
+            fin_guess = prior
+        check.loc[index, 'Final_Guess'] = fin_guess
+    # drop the old labels
+    check.drop(["SCALES_Guess", "SCALES_Judge_Label"], axis=1, inplace=True)
+    # update the column name for the final guess
+    check.rename({'Final_Guess':'SCALES_Guess'}, axis=1, inplace=True)
+    
+    return PCID, check
 
-def PIPE_UPDATE_FINAL_CROSSCHECK(readySEL, RPDF):
-    """Final algorithmic crosscheck of misc. entities that did not get tagged on a ucid when updating the JEL/SEL. This crosscheck compares to identified entities on the ucid to see if the unidentified name could reliably match to the identified one (or if this is a meaningless entity on the case)
+
+def PIPE_UPDATE_FREE_MATCH(ID_Mappings: pd.DataFrame, ALL_NODE_IDs:pd.DataFrame, oldJEL: pd.DataFrame, old_SJID_Data: list, fjc_active: pd.DataFrame):
+    """[summary]
 
     Args:
-        readySEL (pandas.DataFrame): prior SEL rows of data that had inconclusive entities on their case -- these will be crosschecked for updating
-        RPDF (pandas.DataFrame): newest docket SEL rows that may have inconclusive entities as well to be crosschecked
+        ID_Mappings (pd.DataFrame): dataframe from post free match disambiguation that shows the node ids and where they point to
+        ALL_NODE_IDs (pd.DataFrame): master lookup of all entity nodes and what parents they point to
+        oldJEL (pd.DataFrame): prior existing JEL data
+        old_SJID_Data (list): prior SEL tagged SJID data
+        fjc_active (pd.DataFrame): the FJC codebook data
 
     Returns:
-        pandas.DataFrame, pandas.DataFrame : the 2 dataframes of old existing SELs or new SEL rows that will need to be written into JSONL files now that they have been fully disambiguated and labelled
+        pd.DataFrame, pd.DataFrame: the final SEL df ready to be written to a file; the newly updated JEL data
     """
-    # identify any ucids that have inconclusive entities that could be crosschecked
-    XCheck_Old_Ucids = readySEL[readySEL.SJID=="Inconclusive"].ucid.unique()
-    XCheck_Old = readySEL[readySEL.ucid.isin(XCheck_Old_Ucids)]
-    # same deal here
-    XCheck_New_Ucids = RPDF[RPDF.SJID=="Inconclusive"].ucid.unique()
-    XCheck_New = RPDF[RPDF.ucid.isin(XCheck_New_Ucids)]
-    Waiting_New = RPDF[~RPDF.ucid.isin(XCheck_New_Ucids)]
-
-    # the mapper frame is the quick subset used for the crosscheck. UCID, the original entity, the entity parent, and an SJID
-    mapper_frame = pd.concat(
-        [
-            XCheck_Old[['ucid','Extracted_Entity','Final_Pointer','SJID']],
-            XCheck_New[['ucid','Extracted_Entity','Final_Pointer','SJID']]
-        ]
-    )
-
-    # dont need duplicates, make it faster to iterate through
-    mapper_frame = mapper_frame.drop_duplicates()
-
-
-    # I will be building a map by ucid of all entities marked as good (known judge) or "inconclusive"
-    the_map = {}
-    for ucid, cleaned_ent, final_ent, SJID in [tuple(x) for x in mapper_frame.to_numpy()]:
-        has_sjid = True
-        if SJID == 'Inconclusive':
-            has_sjid = False
-
-        if ucid not in the_map:
-            if has_sjid:
-                the_map[ucid] = {"Good": [(final_ent, cleaned_ent, SJID)],"Inconclusive": []}
-            else:
-                the_map[ucid] = {"Good": [],"Inconclusive": [(final_ent, cleaned_ent, SJID)]}
-        else:
-            if has_sjid:
-                the_map[ucid]["Good"].append((final_ent, cleaned_ent, SJID))
-            else:
-                the_map[ucid]["Inconclusive"].append((final_ent, cleaned_ent, SJID))
-
-    # the entities to review will be any entity list from a ucid that is marked as inconclusive
-    review = {}
-    for ucid, ents in the_map.items():
-        if ents['Inconclusive']:
-            # if the ucid had inconclusive entities, keep the set of good and inconclusive ones in the reviewer dict
-            review[ucid] = {k:set(v) for k,v in ents.items()}
-
-    # updater will track which inconclusive entities we were able to update and point towards an SJID
-    updater = []
-    for ucid, ents in tqdm.tqdm(review.items()):
-        for each in ents['Inconclusive']:
-            badname = each[0] # the entity we will compare
-            original = each[1] # what the entity originally looked like
-            m_count = [] # match counter
-            for good in ents['Good']:
-                goodname = good[0] # name of entity with sjid to compare
-                g_original = good[1] # original form of the entity
-
-                # if the pointer entities match or the original entities match, add it as a match
-                if fuzz.partial_ratio(badname,goodname)>=90 or fuzz.partial_ratio(original,g_original)>=90:
-                    m_count.append(good)
-
-            # if there is only one good match from the JEL entities
-            # and the matched entity is a substring of the known judge, match it
-            # this effectively matches ambiguous single token names on a docket
-            if len(m_count)==1 and len([i for i in ents['Good'] if badname in i[0]])==1:
-                good = m_count[0]
-                updater.append({"ucid": ucid,
-                                "Final_Pointer": each[0],
-                                "New_Point": good[0],
-                                "New_SJID": good[2],
-                                "Absorb": True
-                               })
-    # build the DF for the updated mappings
-    RECAST = pd.DataFrame(updater)  
-
-    # log what we updated
-    for each in updater:
-        JU.log_message(f"Final Crosscheck | {each['ucid']:25} |{each['Final_Pointer']:25} --> {each['New_Point']}")
-
-    print("Completing final SEL merge")
-    # merge them together
-    FMDF = XCheck_New.merge(RECAST, how='left', on = ['ucid','Final_Pointer'])
-
-    OMDF = XCheck_Old.merge(RECAST, how='left', on = ['ucid','Final_Pointer'])
-
-    UPDATED_UCIDS = RECAST.ucid.unique()
-
-    # any of the update entities are marked with "Absorb" meaning we will overwrite their SJID (previously inconclusive) and their Final Parent entity (final pointer)
-    FMDF.loc[FMDF.Absorb==True, 'SJID'] = FMDF.New_SJID
-    OMDF.loc[OMDF.Absorb==True, 'SJID'] = OMDF.New_SJID
-    FMDF.loc[FMDF.Absorb==True, 'Final_Pointer'] = FMDF.New_Point
-    OMDF.loc[OMDF.Absorb==True, 'Final_Pointer'] = OMDF.New_Point
-    # drop misc columns created
-    FMDF.drop(['New_Point','New_SJID','Absorb'], axis=1, inplace=True)
-    OMDF.drop(['New_Point','New_SJID','Absorb','N_ucids'], axis=1, inplace=True)
-
-    # create the final output of SEL rows we will be writing to files
-    New_Dockets = pd.concat([FMDF, Waiting_New])
-
-    # from the existing dockets (Old) we only care about rewriting files that saw changes (mapped previously inconclusive entities to now known SJIDs)
-    Old_Dockets = OMDF[OMDF.ucid.isin(UPDATED_UCIDS)]
+    # build the nodes and reduce the ground truth ones
+    NODES, ALL_NODE_IDs = PIPE_NODE_BUILDER(ID_Mappings, ALL_NODE_IDs)
+    ALL_NODES = reduce_ground_truths_update(NODES, oldJEL)
     
+    # newbs are nodes that were not accounted for in prior disambiguation, and thus need to be added to the
+    # master node lookup table with the appropriate attributes
+    newbs = [N for N in ALL_NODES if N.serial_id not in ALL_NODE_IDs.original_SID and N.eligible]
+    APPY = []
+    for each in newbs:
+        ANI_formatted = {
+            'court': None,
+            'node_name': each.name,
+            'original_SID':each.serial_id,
+            'is_FJC': each.is_FJC,
+            'is_BA_MAG': each.is_BA_MAG,
+            'is_eligible': each.eligible,
+            'is_ambiguous': each.is_ambiguous,
+            'Possible_Pointers': each.Possible_Pointers,
+            'NID': each.NID,
+            'BA_MAG_ID': each.BA_MAG_ID,
+            'SJID': each.SJID,
+            'Triple_Consonant': False
+            }
+        APPY.append(ANI_formatted)
+    APPY = pd.DataFrame(APPY)
     
-    return Old_Dockets, New_Dockets
+    # update the node lookup table
+    NODE_LOOKUP = pd.concat([ALL_NODE_IDs, APPY])
+    
+    # split nodes into likley active or dormant judges for our dockets
+    ACTIVE,DORMANT = PIPE_FIND_DORMANT_FJC(ALL_NODES, fjc_active)
+    
+    # run free match disambiguation on the active ones
+    ACTIVE = FREE_MATCH_CYCLER(ACTIVE)
+    
+    # recombine
+    END_NODES = ACTIVE + DORMANT
+    
+    # update the entity parents and pointers after all of the disambiguation
+    PCID, FIN_LOOKUP, IREM = PIPE_REPOINT_Free_Match(END_NODES, ID_Mappings, NODE_LOOKUP)
+    
+    # relabel and generate guesses algorithmically
+    FPCID, newJEL = PIPE_UPDATE_Assign_and_ReLabel(PCID, FIN_LOOKUP, IREM, oldJEL, old_SJID_Data)
+    
+    return FPCID, newJEL

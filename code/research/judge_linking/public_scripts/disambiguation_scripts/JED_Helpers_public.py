@@ -1,6 +1,6 @@
 import JED_Globals_public as JG
 
-def build_inferred_tokens(tokens_raw):
+def build_inferred_tokens(tokens_raw: list):
     """ Function to pre-build various tokenizations of a string name. The tokenizations are abbreviations and suffix dropping
 
     Args:
@@ -32,7 +32,7 @@ def build_inferred_tokens(tokens_raw):
 ############################
 ############################
 
-def build_entity_tokens(token_list, abbreviated_first = False, abbreviated_middle = False, keep_suffix = False):
+def build_entity_tokens(token_list: list, abbreviated_first: bool = False, abbreviated_middle: bool = False, keep_suffix: bool = False):
     """ Inference routine used to build a "last name" and "middle initial" when name mapping
 
     Args:
@@ -201,7 +201,7 @@ def build_entity_tokens(token_list, abbreviated_first = False, abbreviated_middl
     return token_set
 
 
-def build_nicknames_and_unified(tokens_set):
+def build_nicknames_and_unified(tokens_set: list):
     """ Helper Function that takes a list of lists of tokens and converts that list into a nickname or unified name last
     Example: [[Catherine, Samantha, Zeta-Jones]] --> [[Cathy, Sam, Zeta-Jones], [Catherine, Sam, Zeta-Jones], [Cathy, Samantha, Zeta-Jones]]
 

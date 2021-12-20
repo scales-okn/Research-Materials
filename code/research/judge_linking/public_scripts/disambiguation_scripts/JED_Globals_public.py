@@ -32,6 +32,8 @@ NAME_UNIFIER = {
     "Frederick": "Frederick",
     "Harold": "Harold",
     "Herold": "Herold",
+    "Jacquelyn": "Jacqueline",
+    "Jacqueline": "Jacqueline",
     "Janis": "Janice",
     "Janice": "Janice",
     "Johnathan": "Johnathan",
@@ -66,6 +68,8 @@ NAME_UNIFIER = {
     "Nicolas":"Nicholas",
     "Patrick": "Patrick",
     "Patric": "Patrick",
+    "Randal":"Randall",
+    "Randall":"Randall",
     'Ricard':'Richard',
     "Samuel":"Sam",
     "Sam":"Sam",
@@ -92,11 +96,16 @@ NAME_UNIFIER = {
 }
 
 # these names proved extremely difficult to map algorithmically either due to a maternal name drop, hyphenated name, or nicknamed middle name
-FJC_SURNAME_SWAP = {
-    "leslie joyce abrams": "leslie abrams gardner",
-    "raul manuel arias-marxuach":"raul manuel arias",
-    "james e kinkeade": "ed kinkeade",
-    "hugh lawson": "roger h lawson jr"
+FJC_ADDITIONAL_REPRESENTATIONS = {
+    1394646: ["leslie abrams gardner"],
+    6385001: ["raul manuel arias"],
+    1394196: ["nelson stephen romn"],
+    1391691: ["ed kinkeade"],
+    1389116: ["frederick van sickle"],
+    1377801: ["fred biery jr"],
+    1378846: ["ed carnes"],
+    1383696: ["roger h lawson jr"],
+    4027846: ["chip campbell jr"]
 }
 
 # these are coded as nid: lowercase name
@@ -371,7 +380,7 @@ JA_TRIE.add_keywords_from_list(court_other)
 ##~~~~~~~~~~~~~~~
 
 # doing business as, on behalf of are indicators this entity is not a judge
-dba_obo_pattern = re.compile(r'[do][/\.]*b[/\.]*[ao][/\.]*|o/b/?', flags=re.I)
+dba_obo_pattern = re.compile(r'(\b|\s)([do][/\.]*b[/\.]*[ao][/\.]*|o/b/?)(\b|\s)', flags=re.I)
 
 odd_numeric_pattern = re.compile(r'sacr[\d]+-[\d]+', flags=re.I)
 # name with a number after it
@@ -408,10 +417,10 @@ trailing_whitespace = re.compile(r'\s+$')
 front_judge_pattern = re.compile(r'^judge(s?\b|)\s*|^\'ble justice', flags = re.I)
 
 # entity string beginning with "byName" - case sensitive
-by_pattern = re.compile(r'^by(?=[A-Z])') 
+by_pattern = re.compile(r'^(by|to)(?=[A-Z]|\s+)') 
 
 #re: patterns
-re_beg_patt = re.compile(r'^re [A-Z]|^[rR]e$|^ge [A-Z]|Mr\.*\s+')
+re_beg_patt = re.compile(r'^re [A-Z]|^[rR]e$|^ge [A-Z]|^Mr\.*\s+')
 
 ##~~~~~~~~~~~~~~~
 ## End of string patterns
@@ -423,7 +432,7 @@ endre_pattern = re.compile(r' re$', flags=re.I)
 the_pattern = re.compile(r'(?<=[a-z])The') 
 
 # identify a possessive label on a judge
-possessive_pattern = re.compile(r'(?P<POSS>\'s)\s+(?!(jr|sr)\.*)',flags=re.I)
+possessive_pattern = re.compile(r'(?P<POSS>\'s|s\')\s+(?!(jr|sr)\.*)',flags=re.I)
 
 # specialty words that could show up in other words and have a more restricted "end of string" pattern
 single_back = ["court","time","rule","note", 'oral','pris']
@@ -451,7 +460,7 @@ sr_judge_prefix = re.compile(r'^(sr|ch(ief)?|mr)\.*(\s|$)',flags=re.I)
 post_comma = re.compile(fr'(?<!(\b)[a-zA-Z])\.*,(?!\s*({"|".join(suffixes_titles+["j r"])})(\.|\b|\s))',flags=re.I)
 
 # any sort of specialty infill USMJ, USDJ, etc. or judge pattern 
-affixed_judge= re.compile(r'\s(Sr\.* |s\.*)?(U\.*S\.*(D|M)\.*J\.*|(M|D)\.*J\.*D\.*C\.*)\s*|^vj\-', flags=re.I)
+affixed_judge= re.compile(r'(\s|\b|^)(Sr\.* |s\.*)?(U\.*S\.*(D|M)\.*J\.*|(M|D)\.*J\.*D\.*C\.*)\s*|^vj\-', flags=re.I)
 judge_misps = ['j udge', 'ju dge', 'jud ge', 'judg e']
 jmp = re.compile(fr'({"|".join(judge_misps)})\s', flags=re.I)
 
@@ -481,7 +490,7 @@ longform_extraction_pattern = re.compile(r'(by|to)(\b|\s)(\w+\s)*(judge)(\s|\b)(
 mid_patts = [
              "and", "(arr )?as to", "at",
              "by",
-             'Cause',
+             'Cause', "c\.f\. p\.o",
              'discharging order', "document filed by",
              "(f .|a\.) document filed by", "for( the| a)?",
              'good cause', "g\[rant(ing)?",  
@@ -491,7 +500,8 @@ mid_patts = [
              "per", 'plaintiff', 'pro se',
              'r( )?andomly assigned',
              "shall", "so ordered",
-             "that", 'to',
+             "that", 
+             'to',
              'USM','USPO'
              "will( be| take|now)"
              ]
@@ -504,7 +514,8 @@ mpp = re.compile(fr'(\b|\s)({"|".join(mid_patts)})(\b|\s)', flags=re.I)
 wordy = [
 "(^| )a (ll$|coa |big$|rule|first|second|third|fourth|prelim|pretrial|preconf|certified|revocation)",
 "\.a ll$",
-"about E$","about ","admit(s)?","advocate","(administrative|alternative|additional)(ly)?","affir(r)?m(ing|ed|s)?","after","against","altering","ambassador","amend(ed|ing)( doc)?","anddenying",
+"about E-?$","about ","admit(s)?","advocate","(administrative|alternative|additional)(ly)?","affir(r)?m(ing|ed|s)?","after","against","altering","ambassador","amend(ed|ing)( doc)?","anddenying",
+"and ",
 "apologizes","(initial )?appear(ing|ances|s)?", "appoint(ed|ing|ment)",
 "arraign(ment|ing)", "(none )?(un|re)?assign(ing|ed|ment)?", "attach(ing|ment|es|ed)?", "(^|\b|\s)att(orne?)?y","ausa",
 "BAYER A.G","(on or )?before",
@@ -512,24 +523,24 @@ wordy = [
 "(c\.o\.)|(c\.*/o\.*)","^co\.*$","company","conditionally","consent(ing)?","consonant", "construed","correct(ing|ion|ed)?","counsel",
 "damage(s)", "debt","declination","(deft|defendant)(s)?","den(ied|ying)","direct(s)?", "discharging","discloses","dispositive","disqualifie(s|d)","district","docket [A-B]","dplc",
 "e-?(mail|file|sign)(ed)?", "eastern","ECF","el paso","encl(osed)?", "esq(uire)?", "evidence","exec committee",
-"f\.r\.c\.p\.","f\.r\.( )?bankr(\.p\.)?","f\.3d","fairness","fifth","final","find(ing)?","forall","(tor|for|fo r) the (foregoing|following)","form ao","forwarded","from ","fugitive",
+"f\.r\.c\.p\.","[fl]\.(r\.)?( )?civ","f\.r\.( )?bankr(\.p\.)?","f\.3d","fairness","fifth","final","find(ing)?","forall","(tor|for|fo r) the (foregoing|following)","for ","form ao","forwarded","from ","fugitive",
 "grant(ing|s)", "grant (the|in|def|plaint)",
 "hearing", 
 "ia/(ac)?", "(itis |it is|is |)?(hereby|stricken|therefore|likewise|substitut(ed|ing)|cancel(led)?)", 
-"impartiality","^in[\d]+ cr?","initial","instructions","interpret(er|ing)","(spanish |cantonese )?interpreter","(in)?voluntary",
+"\bi'm\b","impartiality","^in[\d]+ cr?","initial","instructions","interpret(er|ing)","(spanish |cantonese )?interpreter","(in)?voluntary",
 "liable","liberally","limine","^L( )?L( )?C\.*$",
-"magistrate","magisrate","magistate","magistriate","mailed","(pre-?)?motion(s)?", "movant",
+"magistrate","magisrate","magistate","magistriate","mailed","(pre-?)?motion(s)?","motion","movant",
 "( |^)n\.*a\.","n/a" ,"Non-","not allowing","nef regenerated",
 " oath"," on[\d]*$","ORDERScheduling","order(ing|ed|s|\b|\s)",
 "p\.s?o\.*(\s|\b|$)" ,"-psi$","pslc",
-"parajudicial officer","Parties( notified)?","pla ","plaintiff","pre(-)?(liminary|trial|motion)","prisoner","proposed","^p(\. | )?so$","psi^","pursuant",
+"parajudicial officer","Parties( notified)?","pla ","plaintiff","pre(-)?(liminary|trial|motion)","prisoner","proposed","pro se","^p(\. | )?so$","psi^","pursuant",
 "(^|\s|\b)qc(\s|\b|$)",
 "r\.a\.s"," re ", "recuse(ing|s|d)?", "(un)?redact(ed)?","refer(ring|red|s)?","regard(s|ing)","regenerated","related","renoting","repl(y|ied|ies|ing)",
 "report","requir(ing|ed|es)","reset","respective(ly)?",
 "^sacr\d+","s(\s|\.)ct\.*","schedul(ed|ing)" ,"(p?re)?sentenc(ing|ed|e)", "served", "(for a |a |)settlement(s)?", "s( )?ign(ed|ing)", "status","staying","standing","stipulation",
 "take(s cross)?","telephon(e|ic)","text","there$","trans((ferr|mitt)ed|(ferr|mitt)ing|crib|cribe(d|r)?)", "traveled","(\s|^)tro(/preliminary| hearing)?(\s|$)",
-"united","upon ","under l\.r\.","under D.Ak.LMR", "(united states|u\. s\.|us|u.s.|u s) (district|courthouse)", "us[dm][cj]", "u\.s\.","usmj",
-"vacat(ing|ed|e)","voir dire",
+"united","upon ","under l\.r\.","under D\.Ak\.LMR", "(united states|u\. s\.|us|u.s.|u s) (district|courthouse)", "us[dm][cj]", "u\.s\.","usmj",
+"vacat(ing|ed|e)","visiting","voir dire",
 "where(fore|as)", "withdraw(ing|s)?", "withou(t)?",
 "will (issue|address|recommend|handle|consider|review|the|enter|make|promptly|extend|set|be |defer|have|preside|sign|coordinate|rely|adopt|appear)",
 "\\\\xc2\\\\xa7|§",
@@ -559,3 +570,312 @@ alphanum_code_patt = re.compile(r'^[a-zA-Z]{1,3}[\d]+', flags=re.I)
 
 
 reversed_name_pattern = re.compile(fr'[\w]+, (?!({"|".join(suffixes_titles)}))', flags=re.I)
+
+sgl_post_loop = {
+    'alan': re.compile(r'baverman', flags=re.I),
+    'alexander': re.compile(r'mackinnon', flags=re.I),
+    'amul': re.compile(r'thapar', flags=re.I),
+    'amy': re.compile(r'totenberg', flags=re.I),
+    'anne': re.compile(r'b[ue]rton', flags=re.I),
+    'anthony': re.compile(r'porcelli', flags=re.I),
+    'arlander': re.compile(r'keys?', flags=re.I),
+    'arthur': re.compile(r'schwab', flags=re.I),
+    'analisa': re.compile(r'torres', flags=re.I),
+    'andre': re.compile(r'birotte,? jr\.?', flags=re.I),
+    'andrea': re.compile(r'wood', flags=re.I),
+    'andrew': re.compile(r'schopler', flags=re.I),
+    'barbara': re.compile(r'major|a\.* mcauliffe', flags=re.I),
+    'barry': re.compile(r't(\.*|ed) moskowitz|seltzer', flags=re.I),
+    'benjamin': re.compile(r'(goldgar|settle)', flags=re.I),
+    'bernard': re.compile(r'friedman', flags=re.I),
+    'billy': re.compile(r'mcdade', flags=re.I),
+    'blanche': re.compile(r'(m\.* )?manning', flags=re.I),
+    'brooke': re.compile(r'wells', flags=re.I),
+    'bruce': re.compile(r'(mcgiverin|guyton|h(\.*|owe) hendricks)|parent', flags=re.I),
+    'cameron': re.compile(r'm(\.*|cgowan) currie', flags=re.I),
+    'candy': re.compile(r'w\.* dale', flags=re.I),
+    'carl': re.compile(r'barbier', flags=re.I),
+    'catherine': re.compile(r'steenland', flags=re.I),
+    'charles': re.compile(r'(price|"skip" rubin|a stampelos|p?\.* kocoras|mills bleil,? sr\.*)', flags=re.I),
+    'choe': re.compile(r'(-)?groves', flags=re.I),
+    'claire': re.compile(r'cecchi', flags=re.I),
+    'clarence': re.compile(r'cooper(s)?', flags=re.I),
+    'colin': re.compile(r'lindsay', flags=re.I),
+    'curtis': re.compile(r'gomez', flags=re.I),
+    'cynthia': re.compile(r'rufe|eddy', flags=re.I),
+    'dan': re.compile(r'stack', flags=re.I),
+    'david': re.compile(r'(g\.* )?larimer|(s\.* )?doty|peebles|rush|lawson|nuffer', flags=re.I),
+    'dearcy': re.compile(r'hall', flags=re.I),
+    'deb': re.compile(r'barnes', flags=re.I),
+    'deborah': re.compile(r'barnes', flags=re.I),
+    'denise': re.compile(r'larue|page hood', flags=re.I),
+    'derrick': re.compile(r'watson', flags=re.I),
+    'diana': re.compile(r'saldana', flags=re.I),
+    'dolly': re.compile(r'(m\.* )?gee', flags=re.I),
+    'donald': re.compile(r'nugent', flags=re.I),
+    'douglas': re.compile(r'mccormick', flags=re.I),
+    'ed': re.compile(r'(m\.* )?chen', flags=re.I),
+    'edward': re.compile(r'nottingham', flags=re.I),
+    'elainee': re.compile(r'bucklo', flags=re.I),
+    'eldon': re.compile(r'(e\.* )?fallon', flags=re.I),
+    'eleanor': re.compile(r'(l\.* )?ross', flags=re.I),
+    'eli': re.compile(r'richardson', flags=re.I),
+    'elizabeth': re.compile(r'hey|wolford', flags=re.I),
+    'eric': re.compile(r'j\.* markovich|long', flags=re.I),
+    'frank': re.compile(r'geraci|whitney', flags=re.I),
+    'freddie': re.compile(r'burton', flags=re.I),
+    'gabriel': re.compile(r'fuentes|gorenstein', flags=re.I),
+    'garrit': re.compile(r'howard', flags=re.I),
+    'george': re.compile(r'caram steeh(,? iii\.*)?|levi russell(,? iii\.*)?|jarrod hazel|h\.* wu', flags=re.I),
+    'geraldine': re.compile(r'(soat-?\s?)?brown', flags=re.I),
+    'gershwin': re.compile(r'drain', flags=re.I),
+    'glenn': re.compile(r'norton', flags=re.I),
+    'graham': re.compile(r'mullen', flags=re.I),
+    'gray': re.compile(r'(m\.*(ichael)? )?borden', flags=re.I),
+    'greg': re.compile(r'gerard guidry', flags=re.I),
+    'gregg': re.compile(r'costa', flags=re.I),
+    'gregory': re.compile(r'van tatenhove', flags=re.I),
+    'gustavo': re.compile(r'gelpi', flags=re.I),
+    'gustave': re.compile(r'diamond', flags=re.I),
+    'halil': re.compile(r'ozerden', flags=re.I),
+    'harry': re.compile(r'leinenweber|mattice(,? jr\.*)?', flags=re.I),
+    'hayden': re.compile(r'head', flags=re.I),
+    'helen': re.compile(r'gillmor', flags=re.I),
+    'henry': re.compile(r'e(\.* |dward )?autrey|lee adams,? jr\.*|coke morgan\,?( jr\.*)?', flags=re.I),
+    'hernandez': re.compile(r'covington', flags=re.I),
+    'hildy': re.compile(r'bowbeer', flags=re.I),
+    'ignacio': re.compile(r'torteya,? iii', flags=re.I),
+    'jacqueline': re.compile(r'rateau|chooljian', flags=re.I),
+    'james': re.compile(r'gwin|ryan|lawrence king|russell grant|shadid|ed(gar)? kinkeade|patrick hanlon|knepp|knoll gardner|(a\.* )?soto|holderman|(c\.* )?francis(,? iv\.*)?|cacheris', flags=re.I),
+    'jan': re.compile(r'dubois', flags=re.I),
+    'janis': re.compile(r'vanmeerveld', flags=re.I),
+    'jay': re.compile(r'c\.* zainey', flags=re.I),
+    'jed': re.compile(r's\.* rakoff', flags=re.I),
+    'jeffery': re.compile(r'frensley', flags=re.I),
+    'jeffrey': re.compile(r'cole|gilbert', flags=re.I),
+    'jerome': re.compile(r'semandle', flags=re.I),
+    'jesus': re.compile(r'g\.* bernal', flags=re.I),
+    'jill': re.compile(r'otake|l\.* burkhardt', flags=re.I),
+    'joan': re.compile(r'b\.* gottschall', flags=re.I),
+    'joe': re.compile(r'brown', flags=re.I),
+    'joel': re.compile(r'(f\.* )?dubina', flags=re.I),
+    'john': re.compile(r'nivison|(w\.* )?debelius(,? iii)?|darrah|ross|love|preston[\s]?bailey', flags=re.I),
+    'jon': re.compile(r'phipps mccalla|(s\.* )?tigar', flags=re.I),
+    'jorge': re.compile(r'alonso', flags=re.I),
+    'jose': re.compile(r'fuste|linares', flags=re.I),
+    'joseph': re.compile(r'spero|(s )?van bokkelen|dickson|lane|anthony diclerico,? jr\.*|saporito|robert goodwin', flags=re.I),
+    'juan': re.compile(r'alanis', flags=re.I),
+    'julian': re.compile(r'abele cook', flags=re.I),
+    'kandis': re.compile(r'westmore', flags=re.I),
+    'karoline': re.compile(r'mehalchick', flags=re.I),
+    'kelly': re.compile(r'rankin', flags=re.I),
+    'kenneth': re.compile(r'mchargh', flags=re.I),
+    'kevin': re.compile(r'gross', flags=re.I),
+    'kimberly': re.compile(r'swank', flags=re.I),
+    'kiyo': re.compile(r'matsumoto', flags=re.I),
+    'kristen': re.compile(r'(l\.* )?mix', flags=re.I),
+    'lacey': re.compile(r'a\.* collier', flags=re.I),
+    'lance': re.compile(r'africk', flags=re.I),
+    'laura': re.compile(r'taylor swain', flags=re.I),
+    'laurel': re.compile(r'beeler', flags=re.I),
+    'lawrence': re.compile(r'e\.* kahn', flags=re.I),
+    'lee': re.compile(r'h\.* rosenthal|yeakel', flags=re.I),
+    'leon': re.compile(r'schy[d]?lower', flags=re.I),
+    'leonard': re.compile(r'davis', flags=re.I),
+    'leslie': re.compile(r'(e\.* )?kobayas[hk]i', flags=re.I),
+    'linda': re.compile(r'caracappa', flags=re.I),
+    'loretta': re.compile(r'preska', flags=re.I),
+    'louis': re.compile(r'stanton|guirol( )?a(,? jr\.*)?', flags=re.I),
+    'luciano': re.compile(r'panici', flags=re.I),
+    'lynwood': re.compile(r'smith', flags=re.I),
+    'mac': re.compile(r'mccoy', flags=re.I),
+    'mae': re.compile(r'd\'agostino', flags=re.I),
+    'marc': re.compile(r'thomas treadwell', flags=re.I),
+    'marcos': re.compile(r'lopez', flags=re.I),
+    'margaret': re.compile(r'goodzeit', flags=re.I),
+    'margo': re.compile(r'brodie', flags=re.I),
+    'marilyn': re.compile(r'go', flags=re.I),
+    'mark': re.compile(r'filip', flags=re.I),
+    'martin': re.compile(r'(l\.*c\.* )?feldman|(c\.* )?ashman|carlson', flags=re.I),
+    'marvin': re.compile(r'aspen|isgur', flags=re.I),
+    'mary': re.compile(r's\.* scriven|alice', flags=re.I),
+    'michael': re.compile(r'baylson|newman|hammer|davis|wilner|mihm|mason|scopelitis|(john )?aloi|urbanski', flags=re.I),
+    'miles': re.compile(r'davis', flags=re.I),
+    'morton': re.compile(r'denlow', flags=re.I),
+    'nanette': re.compile(r'laughrey', flags=re.I),
+    'nannette': re.compile(r'jolivette brown', flags=re.I),
+    'nathanael': re.compile(r'cousins', flags=re.I),
+    'nelson': re.compile(r'(stephen )?rom[aá]n', flags=re.I),
+    'nina': re.compile(r'gershon', flags=re.I),
+    'orinda': re.compile(r'evans', flags=re.I),
+    'paul': re.compile(r'(singh )?grewal|plunkett|Gardephe', flags=re.I),
+    'pedro': re.compile(r'delgado', flags=re.I),
+    'percy': re.compile(r'anderson', flags=re.I),
+    'peter': re.compile(r'beer|buchsbaum|leisure', flags=re.I),
+    'philip': re.compile(r'lammens', flags=re.I),
+    'raag': re.compile(r'singhal', flags=re.I),
+    'raul': re.compile(r'ar[ei]as((-|\s)?marxuach)?', flags=re.I),
+    'reed': re.compile(r'[0o]\'?connor', flags=re.I),
+    'richard': re.compile(r'puglisi|lloret|story', flags=re.I),
+    'robert': re.compile(r'gettleman|(m\.* )?dow|bacharach|junell|chambers|numbers|n\.* scola|b\.* jones,? jr\.*', flags=re.I),
+    'rodney': re.compile(r'sippel', flags=re.I),
+    'rolando': re.compile(r'olvera', flags=re.I),
+    'ronnie': re.compile(r'abrams', flags=re.I),
+    'rosemary': re.compile(r'marquez', flags=re.I),
+    'roslyn': re.compile(r'silver', flags=re.I),
+    'ruben': re.compile(r'castill[o0]s?', flags=re.I),
+    'sallie': re.compile(r'kim', flags=re.I),
+    'samuel': re.compile(r'mays( jr\.*)?', flags=re.I),
+    'scott': re.compile(r'frost|vanderkarr', flags=re.I),
+    'sheila': re.compile(r'finnegan', flags=re.I),
+    'sheri': re.compile(r'py[mn]', flags=re.I),
+    'sidney': re.compile(r'schenkier', flags=re.I),
+    'smith': re.compile(r'camp', flags=re.I),
+    'sonja': re.compile(r'bivins', flags=re.I),
+    'st': re.compile(r'eve', flags=re.I),
+    'staci': re.compile(r'm\.* yandle', flags=re.I),
+    'stanley': re.compile(r'(a\.* )?boone', flags=re.I),
+    'steven': re.compile(r'(i\.* )?locke|nordquist', flags=re.I),
+    'stewart': re.compile(r'dalzell|aaron', flags=re.I),
+    'sue': re.compile(r'myerscough', flags=re.I),
+    'susan': re.compile(r'wigenton|van(\s)?keulen', flags=re.I),
+    'suzanne': re.compile(r'conlon', flags=re.I),
+    'therese': re.compile(r'wiley(\s)?dancks', flags=re.I),
+    'thomas': re.compile(r'thrash|durkin|russell|mcavoy|coffin', flags=re.I),
+    'timothy': re.compile(r'batten(,? sr\.*)?', flags=re.I),
+    'tonianne': re.compile(r'bongiovanni', flags=re.I),
+    'troy': re.compile(r'(l\.* )?nunley', flags=re.I),
+    'vernon': re.compile(r'speede broderick', flags=re.I),
+    'velez': re.compile(r'rive', flags=re.I),
+    'victor': re.compile(r'bianchini', flags=re.I),
+    'waverly': re.compile(r'(d\.* )?crenshaw', flags=re.I),
+    'wayne': re.compile(r'andersen', flags=re.I),
+    'wendy': re.compile(r'beetlestone', flags=re.I),
+    'william': re.compile(r'stafford|cobb|fremming nielsen', flags=re.I)
+}
+
+# same concept, but when the model extracts 2 tokens only but a third intuitively should exist
+dbl_post_loop = {
+    'alan b': re.compile(r'johnson', flags=re.I),
+    'allyne r': re.compile(r'ross', flags=re.I),
+    'anita b': re.compile(r'brody', flags=re.I),
+    'barbara l': re.compile(r'(l(\.*|ynn) )?major', flags=re.I),
+    'barbara lynn': re.compile(r'(l(\.*|ynn) )?major', flags=re.I),
+    'benjamin h': re.compile(r'settle', flags=re.I),
+    'candace j': re.compile(r'smith', flags=re.I),
+    'carla b': re.compile(r'carry', flags=re.I),
+    'christine m': re.compile(r'arguello', flags=re.I),
+    'darrin p': re.compile(r'gayles', flags=re.I),
+    'deborah m': re.compile(r'fine', flags=re.I),
+    'donald c': re.compile(r'nugent', flags=re.I),
+    'eduardo c': re.compile(r'robreno', flags=re.I),
+    'edward g': re.compile(r'smith', flags=re.I),
+    'edward j': re.compile(r'davila', flags=re.I),
+    'edward r': re.compile(r'korman', flags=re.I),
+    'elizabeth s': re.compile(r'chestney', flags=re.I),
+    'frederick j': re.compile(r'kapala', flags=re.I),
+    'gerald a': re.compile(r'mchugh', flags=re.I),
+    'gerald j': re.compile(r'pappert', flags=re.I),
+    'gregory f': re.compile(r'van( )?tatenthove', flags=re.I),
+    'guillermo r': re.compile(r'garcia', flags=re.I),
+    'gustavo a': re.compile(r'gelpi', flags=re.I),
+    'henry s': re.compile(r'perkin', flags=re.I),
+    'hugh b': re.compile(r'scott', flags=re.I),
+    'james d': re.compile(r'caldwell', flags=re.I),
+    'james f': re.compile(r'holder', flags=re.I),
+    'james r': re.compile(r'case', flags=re.I),
+    'jan e': re.compile(r'dubois', flags=re.I),
+    'janie s': re.compile(r'mayeron', flags=re.I),
+    'jean p': re.compile(r'rosenbluth', flags=re.I),
+    'jeffrey s': re.compile(r'frensley', flags=re.I),
+    'joan b': re.compile(r'gottschall', flags=re.I),
+    'joan h': re.compile(r'lefkow', flags=re.I),
+    'joaquin v': re.compile(r'manibusan(,? jr\.*)?', flags=re.I),
+    'joaquin ve': re.compile(r'manibusan(,? jr\.*)?', flags=re.I),
+    'joel h': re.compile(r'slomsky', flags=re.I),
+    'john a': re.compile(r'nordberg', flags=re.I),
+    'john d': re.compile(r'early', flags=re.I),
+    'john f': re.compile(r'grady', flags=re.I),
+    'john m': re.compile(r'gerrard', flags=re.I),
+    'john p': re.compile(r'cronan', flags=re.I),
+    'john r': re.compile(r'tunheim|adams|padova', flags=re.I),
+    'john w': re.compile(r'degravelles|primomo', flags=re.I),
+    'joseph f': re.compile(r'bataillon', flags=re.I),
+    'joseph s': re.compile(r'van( )?bokkelen', flags=re.I),
+    'juan r': re.compile(r'sanchez', flags=re.I),
+    'karen l': re.compile(r'stevenson', flags=re.I),
+    'kiyo a': re.compile(r'matsumoto', flags=re.I),
+    'lee h': re.compile(r'rosenthal', flags=re.I),
+    'legrome d': re.compile(r'davis', flags=re.I),
+    'leonard p': re.compile(r'stark', flags=re.I),
+    'leslie e': re.compile(r'kobayashi', flags=re.I),
+    'lynn n': re.compile(r'hughes', flags=re.I),
+    'mark l': re.compile(r'van valkenburgh', flags=re.I),
+    'mark r': re.compile(r'hornak', flags=re.I),
+    'martin c': re.compile(r'ashman', flags=re.I),
+    'mary m': re.compile(r'rowland', flags=re.I),
+    'matthew f': re.compile(r'kennelly', flags=re.I),
+    'matthew w': re.compile(r'brann', flags=re.I),
+    'meredith a': re.compile(r'jury', flags=re.I),
+    'michael j': re.compile(r'roemer', flags=re.I),
+    'milton i': re.compile(r'shadur', flags=re.I),
+    'mitchell s': re.compile(r'goldberg', flags=re.I),
+    'morris c': re.compile(r'england(,? jr\.*)?', flags=re.I),
+    'morrison c': re.compile(r'england(,? jr\.*)?', flags=re.I),
+    'naomi r': re.compile(r'buchwald', flags=re.I),
+    'paul l': re.compile(r'abrams', flags=re.I),
+    'paul s': re.compile(r'diamond', flags=re.I),
+    'peter e': re.compile(r'ormsby', flags=re.I),
+    'petrese b': re.compile(r'tucker', flags=re.I),
+    'richard l': re.compile(r'puglisi|bourgeois(,? jr\.*)?', flags=re.I),
+    'robert e': re.compile(r'jones', flags=re.I),
+    'robert f': re.compile(r'kelly', flags=re.I),
+    'robert j': re.compile(r'krask', flags=re.I),
+    'robert t': re.compile(r'numbers(,? ii\.*)?', flags=re.I),
+    'robert w': re.compile(r'gettleman', flags=re.I),
+    'ronald a': re.compile(r'guzman', flags=re.I),
+    'rozella a': re.compile(r'oliver', flags=re.I),
+    'stephen v': re.compile(r'wilson', flags=re.I),
+    'susan e': re.compile(r'cox', flags=re.I),
+    'thomas j': re.compile(r'rueter', flags=re.I),
+    'timothy r': re.compile(r'rice', flags=re.I),
+    'troy l': re.compile(r'nunley', flags=re.I),
+    'william h': re.compile(r'walls', flags=re.I),
+    'william j': re.compile(r'hibbler', flags=re.I),
+    'william k': re.compile(r'sessions(,? iii\.*)?', flags=re.I)
+}
+
+# when the model fails in reverse, we get just a last name but it's possible first names existed before it
+# these patterns search the prior token neighborhoods
+sgl_pre_loop = {
+    'jr': re.compile(r'joaquin v\.?e\.? manibusan(\s)?', flags=re.I),
+    'johnson': re.compile(r'((k)?imberly )?(c\.? )?priest(\s)?', flags=re.I),
+    'amy': re.compile(r'totenberg(\s)?', flags=re.I),
+    'woods': re.compile(r'kay(\s)?', flags=re.I),
+    'yeghiayan': re.compile(r'(\s|\b)der(\s)?', flags=re.I),
+    'james': re.compile(r'-elena(\s)?', flags=re.I)
+}
+
+# again but with 2 tokens
+dbl_pre_loop = {
+    'jr fifth': re.compile(r'joaquin v\.?( )?e\.? manibusan(\s)?', flags=re.I),
+    'manibusan jr': re.compile(r'joaquin v\.?( )?e\.?( manibusan(\s)?)?', flags=re.I)
+}
+
+# loop of tokens where if we find this token and the the next token in the post-neighborhood matches these patterns, we know it's not an entity
+# and we also know we should void the match
+sgl_void_loop = {
+    'will': re.compile(r'will(\s|\b)+(address|adjust|adopt|appear|appoint|be |consider|continue|convene|coordinate|decide|defer|determine|either|enter|establish|extend|further|handle|have|hear |hold |issue|make|necessarily|not |preside|promptly|recommend|rely|remain|review|rule|save|schedule(d)?|set|sign|take|the|upon|update)', flags=re.I),
+    'nef': re.compile(r'regen', flags=re.I),
+    'hai': re.compile(r'precision', flags=re.I),
+    'jeff': re.compile(r'sessions', flags=re.I),
+    'jefferson': re.compile(r'sessions', flags=re.I),
+    'joe': re.compile(r'^s company', flags=re.I)
+    }
+
+dbl_void_loop = {}
+
+# combine the singles and doubles into one dict since they are checked in the same way
+post_loop = {**sgl_post_loop, **dbl_post_loop}
+pre_loop = {**sgl_pre_loop, **dbl_pre_loop}
+void_loop = {**sgl_void_loop, **dbl_void_loop}

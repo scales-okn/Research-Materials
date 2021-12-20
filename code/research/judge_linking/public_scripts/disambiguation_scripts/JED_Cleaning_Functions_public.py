@@ -1,9 +1,10 @@
-from pathlib import Path
 import re
-import sys
 import tqdm
+from collections import defaultdict
 
-sys.path.append('../../../../')
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[3]))
 from support import court_functions as cf
 
 import pandas as pd
@@ -51,18 +52,52 @@ def ingest_raw_entities(dir_path):
     return raw_df, heads_df
 
 
-def ingest_the_fjc(fpath, low = '1700-01-01', high = '2022-12-31', is_update = False):
+def ingest_the_fjc(fpath):
     """ Ingest the FJC demographics data from our SCALES csv annotation version of the codebook
 
     Args:
         fpath (string): FJC fpath from settings or csv
-        low (str, optional): Low end of active judicial dates. Defaults to '1700-01-01'.
-        high (str, optional): High end of active judicial dates. Defaults to '2022-12-31'.
-        is_update(bool, optional): bool if this run is meant for updating the JEL or not. Defaults to False
 
     Returns:
         pandas.DataFrame: long-form DF of the fjc judge data, with 1 row per judge (collapsed the wideform information)
     """
+
+    # customized pattern to handle the FJC's styling of bracketing names that go by initials
+    brack_breaker = re.compile(r'((?<=[a-zA-Z])|^)[\[][a-zA-Z]+[\]](?= [a-zA-Z]|$)',flags=re.I) 
+
+    def _prune_brackets(text: str):
+        """given a pandas row, prune brackets out of the name if they exist
+
+        Args:
+            row (object): pandas row passed with apply
+
+        Returns:
+            list: list of cleaned name(s)
+        """
+        # split on spaces, join as single spaced
+        _splitty = lambda x: " ".join(x.split())
+
+        outs = []
+        # determine if the name has brackets
+        M = brack_breaker.search(text)
+        if M:
+            # create two forms of the bracketless name
+            # voided where the bracketed text is entirely removed
+            voided = f"{text[0:M.start()]}{text[M.end():]}"
+            # replaced where the brackets are removed
+            replaced = text.replace('[','').replace(']','')
+            # apply the splitters
+            outs.append(_splitty(voided))
+            outs.append(_splitty(replaced))
+
+        else:
+            # if no brackets, just apply the splitters
+            outs = [_splitty(text)]
+        
+        outs = [clean_ground_truth_name(x) for x in outs]
+        
+        # return list of name(s)
+        return outs
 
     judge_demographics = pd.read_csv(fpath)
     if 'FullName' not in judge_demographics.columns:
@@ -77,7 +112,8 @@ def ingest_the_fjc(fpath, low = '1700-01-01', high = '2022-12-31', is_update = F
     judge_demographics_cols_keys = ['nid', 'jid', 'FullName', 'Last Name', 'First Name', 'Middle Name', 'Suffix']
 
     # these columns need nuance to extract --  structurally they appear as "column name (#)"
-    judge_demographics_cols_cast = ['Court Type', 'Court Name', 'Appointment Title', 'Confirmation Date', 'Commission Date', 'Termination Date']
+    judge_demographics_cols_cast = [
+        'Court Type', 'Court Name', 'Appointment Title', 'Confirmation Date', 'Commission Date', 'Termination Date']
 
     # extract rows from the dataframe, but make it a long frame instead of wide using dictionaries
     new_rows = []
@@ -95,38 +131,141 @@ def ingest_the_fjc(fpath, low = '1700-01-01', high = '2022-12-31', is_update = F
 
     # make into DF
     fjc_expanded = pd.DataFrame(new_rows)
-    # drop NA's and ## DEPR: non District Court Judges
-    fjc_expanded = fjc_expanded[(~fjc_expanded['Court Name'].isna())].copy() # & (fjc_expanded['Court Type'] == 'U.S. District Court')].copy()
+    # drop NA's
+    # NAs exist because we ranged to 7, but not all judges had 6 appointments
+    fjc_expanded = fjc_expanded[(~fjc_expanded['Court Name'].isna())].copy() 
+
+    # sort by nid and appt
     fjc_expanded.sort_values(["nid","jid","Appointment Number"], inplace=True)
+
     # convert district court names to abbreviations
     name2abb = {c: cf.classify(c) for c in fjc_expanded['Court Name'].unique().tolist()}
     fjc_expanded['Court Name Abb'] = fjc_expanded['Court Name'].map(name2abb)
+
+    # fill nulls for termination to today (not yet terminated); convert date cols to datetimes
     fjc_expanded['Termination Date'].fillna(pd.to_datetime('today').date(), inplace=True)
     fjc_expanded['Commission Date'] = fjc_expanded['Commission Date'].apply(lambda x: pd.to_datetime(x).date())
     fjc_expanded['Termination Date'] = fjc_expanded['Termination Date'].apply(lambda x: pd.to_datetime(x).date())
 
-    # clean the full names
-    fjc_expanded['Simplified Name'] = fjc_expanded.FullName.apply(lambda x: clean_fjc_name(x))
-    # fill NAs so they can be filtered if necessary
-    fjc_expanded["Commission Date"].fillna(fjc_expanded["Termination Date"].apply(lambda x: pd.to_datetime(f"{x.year}-01-01").date()), inplace=True)
-    my_date_range = {"low": pd.to_datetime(low).date(),
-                    "high": pd.to_datetime(high).date()}
+    fjc_expanded['Simplified Name'] = fjc_expanded.FullName
 
-    # filter to specified time range
-    if not is_update:
-        fjc_active = fjc_expanded[
-            (fjc_expanded['Commission Date'] <= my_date_range["high"]) &
-            (fjc_expanded['Termination Date'] >= my_date_range["low"])]
-    else:
-        fjc_active = fjc_expanded
+    # fill NAs so they can be filtered if necessary
+    # we assume a missing commission date is the same year as termination (?)
+    fjc_expanded["Commission Date"].fillna(fjc_expanded["Termination Date"].apply(lambda x: pd.to_datetime(f"{x.year}-01-01").date()), inplace=True)
+
+    fjc_active = fjc_expanded
+
+    nid_courts = defaultdict(list)
+    for nid, court in fjc_active[['nid','Court Name Abb']].to_numpy():
+        # nones will be circuits, appeals, scotus, etc.
+        if court:
+            nid_courts[nid].append(court)
+    nid_courts = {k:list(set(v)) for k,v in nid_courts.items()}
 
     # the output frame should be a cleaned name, original name, nid, earliest commission date and latest known termination date
     fjc_judges = fjc_active.groupby(["Simplified Name","FullName","nid"], as_index=False).agg({'Commission Date': ['min'], 'Termination Date': 'max'})
 
+    fjc_judges['Name_Forms'] = fjc_judges["Simplified Name"].apply(lambda x: _prune_brackets(x))
+    fjc_judges['Courts'] = fjc_judges['nid'].map(nid_courts)
+    
     return fjc_judges
 
+def ingest_ba_mag(fpath_judges: str, fpath_positions: str):
+    """load the bankrupcty and magistrate judge dataset
 
-def clean_fjc_name(testname):
+    Args:
+        fpath_judges (pathlib.Path or str): path to file for judges baseline sheet
+        fpath_positions (pathlib.Path or str): path to file for judges position history
+
+    Returns:
+        list: list of magistrate and bankrupcty names
+    """
+    
+    def _name_fusion(row):
+        """assemble a full name using a row of the data
+
+        Args:
+            row (object): pandas row of data from the BA/MAG set
+
+        Returns:
+            str: assembled full name of a judge
+        """
+        # modelled here in case column names ever change
+        nameset = {
+            "FN": row['NAME_FIRST'],
+            "MN": row['NAME_MIDDLE'],
+            "LN": row['NAME_LAST'],
+            "SUFF": row['NAME_SUFFIX']
+        }
+
+        # fill NAs as empty strings
+        for k,v in nameset.items():
+            if pd.isna(v):
+                nameset[k] = ''
+        # make a full name
+        creation = f"{nameset['FN']} {nameset['MN']} {nameset['LN']} {nameset['SUFF']}"
+        # return as the joined split to alleviate spacing oddities when a name part is missing
+        return " ".join(creation.split())
+    
+    def _label_appointment(app: str):
+        """Using the datasets ID, label the judge type using inference on the ID
+
+        Args:
+            app (str): appointment ID
+
+        Returns:
+            str: Bankruptcy, Magistrate, or None
+        """
+        if 'bnk' in app:
+            return "Bankruptcy_Judge"
+        elif 'mag' in app:
+            return 'Magistrate_Judge'
+        else:
+            return None
+    
+    # load the data
+    BK_MAG = pd.read_csv(fpath_judges)
+    # make full names
+    BK_MAG['_full_name'] = BK_MAG.apply(_name_fusion, axis=1)
+    # tag appointment type
+    BK_MAG['_tag'] = BK_MAG.JUDGE_ID.apply(_label_appointment)
+    # create cleaned name forms
+    BK_MAG['_cleaned_name'] = BK_MAG._full_name.apply(lambda x: clean_ground_truth_name(x))
+
+    bm_map = defaultdict(list)
+    for bmid, clean_name in BK_MAG[["JUDGE_ID","_cleaned_name"]].to_numpy():
+        bm_map[clean_name].append(bmid)
+
+    bm_map = {k:"/".join(values) for k,values in bm_map.items()}
+    BK_MAG['__pseudo_JID'] = BK_MAG._cleaned_name.map(bm_map)
+    
+    ### LOAD POSITIONS
+    pos_df = pd.read_csv(fpath_positions)
+    toss_courts = ['county','tax','municipal','city','appeals','circuit', 'compensation', 'superior']
+
+    # prune to the particular judge roles we care about
+    subset = pos_df[
+        (pos_df.TITLE.apply(lambda x: 'judge' in str(x).lower())) &
+        (pos_df.INSTITUTION.apply(lambda x: 'court' in str(x).lower())) &
+        (pos_df.INSTITUTION.apply(lambda x: not any(i in str(x).lower() for i in toss_courts))) &
+        (pos_df.INSTITUTION.apply(lambda x: str(x)[0:4].lower()) == 'u.s.')
+    ].copy()
+
+    subset['_court_abbrv'] = subset.INSTITUTION.apply(lambda x: cf.classify(x))
+
+    jid_courts = defaultdict(list)
+    for jid, court in subset[['JUDGE_ID','_court_abbrv']].to_numpy():
+        jid_courts[jid].append(court)
+    jid_courts = {k:list(set(v)) for k,v in jid_courts.items()}
+
+    BK_MAG['_courts'] = BK_MAG.JUDGE_ID.map(jid_courts)
+
+    ELIGIBLE = BK_MAG[~BK_MAG._courts.isna()]
+
+    return ELIGIBLE[['JUDGE_ID', '_full_name','_cleaned_name','_tag','_courts','__pseudo_JID']]
+
+
+def clean_ground_truth_name(testname: str):
     """ given an FJC entity name, clean it
 
     Args:
@@ -138,7 +277,8 @@ def clean_fjc_name(testname):
     # order matters in execution (i.e. assuming numbers exist until numbers are stripped out)
     testname = testname.translate(JG.accent_repl) # replace accented letters in case clerks did not use accents in entry
     
-    testname = re.sub(r'(\'s|\\\'s|\\xc2|\\xa71)', r'', testname,flags=re.I) # replace as blanks
+    testname = re.sub(r'(\'s[\s\b$]|\\\'s[\s\b$])', r' ', testname,flags=re.I) # replace as blanks possessive s
+    testname = re.sub(r'(\\xc2|\\xa71)', r'', testname,flags=re.I) # replace as blanks
     testname = re.sub(r'(\\xc3|\\xa1)', r'a', testname,flags=re.I) # replace as a
     testname = re.sub(r'\\\'','\'',testname) # make these normal apostrophes
     
@@ -162,11 +302,12 @@ def clean_fjc_name(testname):
     
     # any remaining periods go bye bye
     testname = testname.replace('.','')
+    testname = testname.replace("'",'') # remove apostrophes now
     
     # default split will remove odd double spacing, then rejoin
     return ' '.join(testname.lower().split())
 
-def ingest_header_entities(fpath):
+def ingest_header_entities(fpath: str):
     """ingest the extracted parties or counsels data. 
 
     Args:
@@ -180,7 +321,7 @@ def ingest_header_entities(fpath):
 
     return in_df
 
-def reshuffle_exception_entities(RDF):
+def reshuffle_exception_entities(RDF: pd.DataFrame, JEL = []):
     """Custom function that matches the SPACY V3 Extractor. The Model has english language bias and fails in a few notable ways
     - believes latinx names end after one token (Judge Ignacio Torres -- model thinks "Judge Ignacio")
     - Same concept for many non-english names
@@ -192,471 +333,454 @@ def reshuffle_exception_entities(RDF):
 
     Args:
         RDF (pandas.DataFrame): large dataframe of entry row extractions to be checked for neighborhood searches. Need ucid, docket_index, full_span_start, Ent_span_start to be used as indexes
-
+        JEL (pandas.DataFrame, optional): if a prior run has been completed from disambiguation we can leverage those entities from the JEL
     Returns:
         pandas.DataFrame: same length as input dataframe, but with reshuffled entities (included tokens from neighborhoods) if the extracted entity qualified in the checks
     """
+    from flashtext.keyword import KeywordProcessor
 
-    # running dict of possible "single token extractions" the spacy model makes that could be accurate single tokens, but could also have trailing (post) tokens after
-    # them that we want to double check are not there
+    def _reshuffle_subset(subset_df: pd.DataFrame, CPatts: dict, voids: dict):
+        """This be the meat and potatoes. Algorithmic reshuffling function that takes an extracted entity
+        and evaluates the text neighborhood surrounding it to determine if the extraction window should be expanded
+        based on other extracted entities.
 
-    # the regex patterns are intended to be "search"ed on the neighborhood of post-entity tokens, and if the last name appears, then it matches
-    sgl_post_loop = {
-        'alan': re.compile(r'baverman', flags=re.I),
-        'alexander': re.compile(r'mackinnon', flags=re.I),
-        'amul': re.compile(r'thapar', flags=re.I),
-        'amy': re.compile(r'totenberg', flags=re.I),
-        'anne': re.compile(r'b[ue]rton', flags=re.I),
-        'anthony': re.compile(r'porcelli', flags=re.I),
-        'arlander': re.compile(r'keys?', flags=re.I),
-        'arthur': re.compile(r'schwab', flags=re.I),
-        'analisa': re.compile(r'torres', flags=re.I),
-        'andre': re.compile(r'birotte,? jr\.?', flags=re.I),
-        'andrea': re.compile(r'wood', flags=re.I),
-        'andrew': re.compile(r'schopler', flags=re.I),
-        'barbara': re.compile(r'major|a\.* mcauliffe', flags=re.I),
-        'barry': re.compile(r't(\.*|ed) moskowitz|seltzer', flags=re.I),
-        'benjamin': re.compile(r'(goldgar|settle)', flags=re.I),
-        'bernard': re.compile(r'friedman', flags=re.I),
-        'billy': re.compile(r'mcdade', flags=re.I),
-        'blanche': re.compile(r'(m\.* )?manning', flags=re.I),
-        'brooke': re.compile(r'wells', flags=re.I),
-        'bruce': re.compile(r'(mcgiverin|guyton|h(\.*|owe) hendricks)|parent', flags=re.I),
-        'cameron': re.compile(r'm(\.*|cgowan) currie', flags=re.I),
-        'candy': re.compile(r'w\.* dale', flags=re.I),
-        'carl': re.compile(r'barbier', flags=re.I),
-        'catherine': re.compile(r'steenland', flags=re.I),
-        'charles': re.compile(r'(price|"skip" rubin|a stampelos|p?\.* kocoras|mills bleil,? sr\.*)', flags=re.I),
-        'choe': re.compile(r'(-)?groves', flags=re.I),
-        'claire': re.compile(r'cecchi', flags=re.I),
-        'clarence': re.compile(r'cooper(s)?', flags=re.I),
-        'colin': re.compile(r'lindsay', flags=re.I),
-        'curtis': re.compile(r'gomez', flags=re.I),
-        'cynthia': re.compile(r'rufe|eddy', flags=re.I),
-        'dan': re.compile(r'stack', flags=re.I),
-        'david': re.compile(r'(g\.* )?larimer|(s\.* )?doty|peebles|rush|lawson|nuffer', flags=re.I),
-        'dearcy': re.compile(r'hall', flags=re.I),
-        'deb': re.compile(r'barnes', flags=re.I),
-        'deborah': re.compile(r'barnes', flags=re.I),
-        'denise': re.compile(r'larue|page hood', flags=re.I),
-        'derrick': re.compile(r'watson', flags=re.I),
-        'diana': re.compile(r'saldana', flags=re.I),
-        'dolly': re.compile(r'(m\.* )?gee', flags=re.I),
-        'donald': re.compile(r'nugent', flags=re.I),
-        'douglas': re.compile(r'mccormick', flags=re.I),
-        'ed': re.compile(r'(m\.* )?chen', flags=re.I),
-        'edward': re.compile(r'nottingham', flags=re.I),
-        'elainee': re.compile(r'bucklo', flags=re.I),
-        'eldon': re.compile(r'(e\.* )?fallon', flags=re.I),
-        'eleanor': re.compile(r'(l\.* )?ross', flags=re.I),
-        'eli': re.compile(r'richardson', flags=re.I),
-        'elizabeth': re.compile(r'hey|wolford', flags=re.I),
-        'eric': re.compile(r'j\.* markovich|long', flags=re.I),
-        'frank': re.compile(r'geraci|whitney', flags=re.I),
-        'freddie': re.compile(r'burton', flags=re.I),
-        'gabriel': re.compile(r'fuentes|gorenstein', flags=re.I),
-        'garrit': re.compile(r'howard', flags=re.I),
-        'george': re.compile(r'caram steeh(,? iii\.*)?|levi russell(,? iii\.*)?|jarrod hazel|h\.* wu', flags=re.I),
-        'geraldine': re.compile(r'(soat-?\s?)?brown', flags=re.I),
-        'gershwin': re.compile(r'drain', flags=re.I),
-        'glenn': re.compile(r'norton', flags=re.I),
-        'graham': re.compile(r'mullen', flags=re.I),
-        'gray': re.compile(r'(m\.*(ichael)? )?borden', flags=re.I),
-        'greg': re.compile(r'gerard guidry', flags=re.I),
-        'gregg': re.compile(r'costa', flags=re.I),
-        'gregory': re.compile(r'van tatenhove', flags=re.I),
-        'gustavo': re.compile(r'gelpi', flags=re.I),
-        'gustave': re.compile(r'diamond', flags=re.I),
-        'halil': re.compile(r'ozerden', flags=re.I),
-        'harry': re.compile(r'leinenweber|mattice(,? jr\.*)?', flags=re.I),
-        'hayden': re.compile(r'head', flags=re.I),
-        'helen': re.compile(r'gillmor', flags=re.I),
-        'henry': re.compile(r'e(\.* |dward )?autrey|lee adams,? jr\.*|coke morgan\,?( jr\.*)?', flags=re.I),
-        'hernandez': re.compile(r'covington', flags=re.I),
-        'hildy': re.compile(r'bowbeer', flags=re.I),
-        'ignacio': re.compile(r'torteya,? iii', flags=re.I),
-        'jacqueline': re.compile(r'rateau|chooljian', flags=re.I),
-        'james': re.compile(r'gwin|ryan|lawrence king|russell grant|shadid|ed(gar)? kinkeade|patrick hanlon|knepp|knoll gardner|(a\.* )?soto|holderman|(c\.* )?francis(,? iv\.*)?|cacheris', flags=re.I),
-        'jan': re.compile(r'dubois', flags=re.I),
-        'janis': re.compile(r'vanmeerveld', flags=re.I),
-        'jay': re.compile(r'c\.* zainey', flags=re.I),
-        'jed': re.compile(r's\.* rakoff', flags=re.I),
-        'jeffery': re.compile(r'frensley', flags=re.I),
-        'jeffrey': re.compile(r'cole|gilbert', flags=re.I),
-        'jerome': re.compile(r'semandle', flags=re.I),
-        'jesus': re.compile(r'g\.* bernal', flags=re.I),
-        'jill': re.compile(r'otake|l\.* burkhardt', flags=re.I),
-        'joan': re.compile(r'b\.* gottschall', flags=re.I),
-        'joe': re.compile(r'brown', flags=re.I),
-        'joel': re.compile(r'(f\.* )?dubina', flags=re.I),
-        'john': re.compile(r'nivison|(w\.* )?debelius(,? iii)?|darrah|ross|love|preston[\s]?bailey', flags=re.I),
-        'jon': re.compile(r'phipps mccalla|(s\.* )?tigar', flags=re.I),
-        'jorge': re.compile(r'alonso', flags=re.I),
-        'jose': re.compile(r'fuste|linares', flags=re.I),
-        'joseph': re.compile(r'spero|(s )?van bokkelen|dickson|lane|anthony diclerico,? jr\.*|saporito|robert goodwin', flags=re.I),
-        'juan': re.compile(r'alanis', flags=re.I),
-        'julian': re.compile(r'abele cook', flags=re.I),
-        'kandis': re.compile(r'westmore', flags=re.I),
-        'karoline': re.compile(r'mehalchick', flags=re.I),
-        'kelly': re.compile(r'rankin', flags=re.I),
-        'kenneth': re.compile(r'mchargh', flags=re.I),
-        'kevin': re.compile(r'gross', flags=re.I),
-        'kimberly': re.compile(r'swank', flags=re.I),
-        'kiyo': re.compile(r'matsumoto', flags=re.I),
-        'kristen': re.compile(r'(l\.* )?mix', flags=re.I),
-        'lacey': re.compile(r'a\.* collier', flags=re.I),
-        'lance': re.compile(r'africk', flags=re.I),
-        'laura': re.compile(r'taylor swain', flags=re.I),
-        'laurel': re.compile(r'beeler', flags=re.I),
-        'lawrence': re.compile(r'e\.* kahn', flags=re.I),
-        'lee': re.compile(r'h\.* rosenthal|yeakel', flags=re.I),
-        'leon': re.compile(r'schy[d]?lower', flags=re.I),
-        'leonard': re.compile(r'davis', flags=re.I),
-        'leslie': re.compile(r'(e\.* )?kobayas[hk]i', flags=re.I),
-        'linda': re.compile(r'caracappa', flags=re.I),
-        'loretta': re.compile(r'preska', flags=re.I),
-        'louis': re.compile(r'stanton|guirol( )?a(,? jr\.*)?', flags=re.I),
-        'luciano': re.compile(r'panici', flags=re.I),
-        'lynwood': re.compile(r'smith', flags=re.I),
-        'mac': re.compile(r'mccoy', flags=re.I),
-        'mae': re.compile(r'd\'agostino', flags=re.I),
-        'marc': re.compile(r'thomas treadwell', flags=re.I),
-        'marcos': re.compile(r'lopez', flags=re.I),
-        'margaret': re.compile(r'goodzeit', flags=re.I),
-        'margo': re.compile(r'brodie', flags=re.I),
-        'marilyn': re.compile(r'go', flags=re.I),
-        'mark': re.compile(r'filip', flags=re.I),
-        'martin': re.compile(r'(l\.*c\.* )?feldman|(c\.* )?ashman|carlson', flags=re.I),
-        'marvin': re.compile(r'aspen|isgur', flags=re.I),
-        'mary': re.compile(r's\.* scriven|alice', flags=re.I),
-        'michael': re.compile(r'baylson|newman|hammer|davis|wilner|mihm|mason|scopelitis|(john )?aloi|urbanski', flags=re.I),
-        'miles': re.compile(r'davis', flags=re.I),
-        'morton': re.compile(r'denlow', flags=re.I),
-        'nanette': re.compile(r'laughrey', flags=re.I),
-        'nannette': re.compile(r'jolivette brown', flags=re.I),
-        'nathanael': re.compile(r'cousins', flags=re.I),
-        'nelson': re.compile(r'(stephen )?rom[aá]n', flags=re.I),
-        'nina': re.compile(r'gershon', flags=re.I),
-        'orinda': re.compile(r'evans', flags=re.I),
-        'paul': re.compile(r'(singh )?grewal|plunkett|Gardephe', flags=re.I),
-        'pedro': re.compile(r'delgado', flags=re.I),
-        'percy': re.compile(r'anderson', flags=re.I),
-        'peter': re.compile(r'beer|buchsbaum|leisure', flags=re.I),
-        'philip': re.compile(r'lammens', flags=re.I),
-        'raag': re.compile(r'singhal', flags=re.I),
-        'raul': re.compile(r'ar[ei]as((-|\s)?marxuach)?', flags=re.I),
-        'reed': re.compile(r'[0o]\'?connor', flags=re.I),
-        'richard': re.compile(r'puglisi|lloret|story', flags=re.I),
-        'robert': re.compile(r'gettleman|(m\.* )?dow|bacharach|junell|chambers|numbers|n\.* scola|b\.* jones,? jr\.*', flags=re.I),
-        'rodney': re.compile(r'sippel', flags=re.I),
-        'rolando': re.compile(r'olvera', flags=re.I),
-        'ronnie': re.compile(r'abrams', flags=re.I),
-        'rosemary': re.compile(r'marquez', flags=re.I),
-        'roslyn': re.compile(r'silver', flags=re.I),
-        'ruben': re.compile(r'castill[o0]s?', flags=re.I),
-        'sallie': re.compile(r'kim', flags=re.I),
-        'samuel': re.compile(r'mays( jr\.*)?', flags=re.I),
-        'scott': re.compile(r'frost|vanderkarr', flags=re.I),
-        'sheila': re.compile(r'finnegan', flags=re.I),
-        'sheri': re.compile(r'py[mn]', flags=re.I),
-        'sidney': re.compile(r'schenkier', flags=re.I),
-        'smith': re.compile(r'camp', flags=re.I),
-        'sonja': re.compile(r'bivins', flags=re.I),
-        'st': re.compile(r'eve', flags=re.I),
-        'staci': re.compile(r'm\.* yandle', flags=re.I),
-        'stanley': re.compile(r'(a\.* )?boone', flags=re.I),
-        'steven': re.compile(r'(i\.* )?locke|nordquist', flags=re.I),
-        'stewart': re.compile(r'dalzell|aaron', flags=re.I),
-        'sue': re.compile(r'myerscough', flags=re.I),
-        'susan': re.compile(r'wigenton|van(\s)?keulen', flags=re.I),
-        'suzanne': re.compile(r'conlon', flags=re.I),
-        'therese': re.compile(r'wiley(\s)?dancks', flags=re.I),
-        'thomas': re.compile(r'thrash|durkin|russell|mcavoy|coffin', flags=re.I),
-        'timothy': re.compile(r'batten(,? sr\.*)?', flags=re.I),
-        'tonianne': re.compile(r'bongiovanni', flags=re.I),
-        'troy': re.compile(r'(l\.* )?nunley', flags=re.I),
-        'vernon': re.compile(r'speede broderick', flags=re.I),
-        'velez': re.compile(r'rive', flags=re.I),
-        'victor': re.compile(r'bianchini', flags=re.I),
-        'waverly': re.compile(r'(d\.* )?crenshaw', flags=re.I),
-        'wayne': re.compile(r'andersen', flags=re.I),
-        'wendy': re.compile(r'beetlestone', flags=re.I),
-        'william': re.compile(r'stafford|cobb|fremming nielsen', flags=re.I)
-    }
+        Args:
+            subset_df (pd.DataFrame): entity extractions data frame, split by court
+            CPatts (dict): dictionary of name specific preceding and following patterns for entities
+            voids (dict): dictionary of voids to consider
 
-    # same concept, but when the model extracts 2 tokens only but a third intuitively should exist
-    dbl_post_loop = {
-        'alan b': re.compile(r'johnson', flags=re.I),
-        'allyne r': re.compile(r'ross', flags=re.I),
-        'anita b': re.compile(r'brody', flags=re.I),
-        'barbara l': re.compile(r'(l(\.*|ynn) )?major', flags=re.I),
-        'barbara lynn': re.compile(r'(l(\.*|ynn) )?major', flags=re.I),
-        'benjamin h': re.compile(r'settle', flags=re.I),
-        'candace j': re.compile(r'smith', flags=re.I),
-        'carla b': re.compile(r'carry', flags=re.I),
-        'christine m': re.compile(r'arguello', flags=re.I),
-        'darrin p': re.compile(r'gayles', flags=re.I),
-        'deborah m': re.compile(r'fine', flags=re.I),
-        'donald c': re.compile(r'nugent', flags=re.I),
-        'eduardo c': re.compile(r'robreno', flags=re.I),
-        'edward g': re.compile(r'smith', flags=re.I),
-        'edward j': re.compile(r'davila', flags=re.I),
-        'edward r': re.compile(r'korman', flags=re.I),
-        'elizabeth s': re.compile(r'chestney', flags=re.I),
-        'frederick j': re.compile(r'kapala', flags=re.I),
-        'gerald a': re.compile(r'mchugh', flags=re.I),
-        'gerald j': re.compile(r'pappert', flags=re.I),
-        'gregory f': re.compile(r'van( )?tatenthove', flags=re.I),
-        'guillermo r': re.compile(r'garcia', flags=re.I),
-        'gustavo a': re.compile(r'gelpi', flags=re.I),
-        'henry s': re.compile(r'perkin', flags=re.I),
-        'hugh b': re.compile(r'scott', flags=re.I),
-        'james d': re.compile(r'caldwell', flags=re.I),
-        'james f': re.compile(r'holder', flags=re.I),
-        'james r': re.compile(r'case', flags=re.I),
-        'jan e': re.compile(r'dubois', flags=re.I),
-        'janie s': re.compile(r'mayeron', flags=re.I),
-        'jean p': re.compile(r'rosenbluth', flags=re.I),
-        'jeffrey s': re.compile(r'frensley', flags=re.I),
-        'joan b': re.compile(r'gottschall', flags=re.I),
-        'joan h': re.compile(r'lefkow', flags=re.I),
-        'joaquin v': re.compile(r'manibusan(,? jr\.*)?', flags=re.I),
-        'joaquin ve': re.compile(r'manibusan(,? jr\.*)?', flags=re.I),
-        'joel h': re.compile(r'slomsky', flags=re.I),
-        'john a': re.compile(r'nordberg', flags=re.I),
-        'john d': re.compile(r'early', flags=re.I),
-        'john f': re.compile(r'grady', flags=re.I),
-        'john m': re.compile(r'gerrard', flags=re.I),
-        'john p': re.compile(r'cronan', flags=re.I),
-        'john r': re.compile(r'tunheim|adams|padova', flags=re.I),
-        'john w': re.compile(r'degravelles|primomo', flags=re.I),
-        'joseph f': re.compile(r'bataillon', flags=re.I),
-        'joseph s': re.compile(r'van( )?bokkelen', flags=re.I),
-        'juan r': re.compile(r'sanchez', flags=re.I),
-        'karen l': re.compile(r'stevenson', flags=re.I),
-        'kiyo a': re.compile(r'matsumoto', flags=re.I),
-        'lee h': re.compile(r'rosenthal', flags=re.I),
-        'legrome d': re.compile(r'davis', flags=re.I),
-        'leonard p': re.compile(r'stark', flags=re.I),
-        'leslie e': re.compile(r'kobayashi', flags=re.I),
-        'lynn n': re.compile(r'hughes', flags=re.I),
-        'mark l': re.compile(r'van valkenburgh', flags=re.I),
-        'mark r': re.compile(r'hornak', flags=re.I),
-        'martin c': re.compile(r'ashman', flags=re.I),
-        'mary m': re.compile(r'rowland', flags=re.I),
-        'matthew f': re.compile(r'kennelly', flags=re.I),
-        'matthew w': re.compile(r'brann', flags=re.I),
-        'meredith a': re.compile(r'jury', flags=re.I),
-        'michael j': re.compile(r'roemer', flags=re.I),
-        'milton i': re.compile(r'shadur', flags=re.I),
-        'mitchell s': re.compile(r'goldberg', flags=re.I),
-        'morris c': re.compile(r'england(,? jr\.*)?', flags=re.I),
-        'morrison c': re.compile(r'england(,? jr\.*)?', flags=re.I),
-        'naomi r': re.compile(r'buchwald', flags=re.I),
-        'paul l': re.compile(r'abrams', flags=re.I),
-        'paul s': re.compile(r'diamond', flags=re.I),
-        'peter e': re.compile(r'ormsby', flags=re.I),
-        'petrese b': re.compile(r'tucker', flags=re.I),
-        'richard l': re.compile(r'puglisi|bourgeois(,? jr\.*)?', flags=re.I),
-        'robert e': re.compile(r'jones', flags=re.I),
-        'robert f': re.compile(r'kelly', flags=re.I),
-        'robert j': re.compile(r'krask', flags=re.I),
-        'robert t': re.compile(r'numbers(,? ii\.*)?', flags=re.I),
-        'robert w': re.compile(r'gettleman', flags=re.I),
-        'ronald a': re.compile(r'guzman', flags=re.I),
-        'rozella a': re.compile(r'oliver', flags=re.I),
-        'stephen v': re.compile(r'wilson', flags=re.I),
-        'susan e': re.compile(r'cox', flags=re.I),
-        'thomas j': re.compile(r'rueter', flags=re.I),
-        'timothy r': re.compile(r'rice', flags=re.I),
-        'troy l': re.compile(r'nunley', flags=re.I),
-        'william h': re.compile(r'walls', flags=re.I),
-        'william j': re.compile(r'hibbler', flags=re.I),
-        'william k': re.compile(r'sessions(,? iii\.*)?', flags=re.I)
-    }
+        Returns:
+            pandas.DataFrame: the reshuffled dataset with newly extracted entities if their neighborhoods returned a match
+        """
+        remapped = []
+        for index, row in subset_df.iterrows():
+            # need keys to map the remapped entities to the original row (this is only done on the entries and not the headers df)
+            # the entries df is join safe because docket index is guaranteed to be non-null and the entity span starts cannot overlap from the spacy model
+            lookup = {'ucid':row['ucid'],
+                    'docket_index':row['docket_index'],
+                    'full_span_start': row['full_span_start'],
+                    'Ent_span_start': row['Ent_span_start']}
 
-    # when the model fails in reverse, we get just a last name but it's possible first names existed before it
-    # these patterns search the prior token neighborhoods
-    sgl_pre_loop = {
-        'jr': re.compile(r'joaquin v\.?e\.? manibusan(\s)?', flags=re.I),
-        'johnson': re.compile(r'((k)?imberly )?(c\.? )?priest(\s)?', flags=re.I),
-        'amy': re.compile(r'totenberg(\s)?', flags=re.I),
-        'woods': re.compile(r'kay(\s)?', flags=re.I),
-        'yeghiayan': re.compile(r'(\s|\b)der(\s)?', flags=re.I),
-        'james': re.compile(r'-elena(\s)?', flags=re.I)
-    }
+            # every type of check will need the same base variables
+            # original text
+            OT = str(row['original_text'])
+            # span locations
+            FSS = row['full_span_start']
+            ESS = row['Ent_span_start']
+            ESE = row['Ent_span_end']   
 
-    # again but with 2 tokens
-    dbl_pre_loop = {
-        'jr fifth': re.compile(r'joaquin v\.?( )?e\.? manibusan(\s)?', flags=re.I),
-        'manibusan jr': re.compile(r'joaquin v\.?( )?e\.?( manibusan(\s)?)?', flags=re.I)
-    }
+            # default new neighborhoods are just the originals
+            new_locs = {
+                '_triggered': False,
+                'New_span_start':ESS,
+                'New_span_end': ESE,
+                'New_pre_5': row['extracted_pre_5'],
+                'New_Entity': row['extracted_entity'],
+                'New_post_5': row['extracted_post_5']
+                }
 
-    # loop of tokens where if we find this token and the the next token in the post-neighborhood matches these patterns, we know it's not an entity
-    # and we also know we should void the match
-    sgl_void_loop = {
-        'will': re.compile(r'will(\s|\b)+(address|adjust|adopt|appear|appoint|be |consider|continue|convene|coordinate|decide|defer|determine|either|enter|establish|extend|further|handle|have|hear |hold |issue|make|necessarily|not |preside|promptly|recommend|rely|remain|review|rule|save|schedule(d)?|set|sign|take|the|upon|update)', flags=re.I),
-        'nef': re.compile(r'regen', flags=re.I),
-        'hai': re.compile(r'precision', flags=re.I),
-        'jeff': re.compile(r'sessions', flags=re.I),
-        'jefferson': re.compile(r'sessions', flags=re.I),
-        'joe': re.compile(r'^s company', flags=re.I)
-        }
+            CE = row["CLEANSED_ENTITY"]
+            not_voided = True
 
-    dbl_void_loop = {}
+            # if the entity qualifies as one that could be voided (like Will) determine if it voidable
+            if CE in voids:
+                VPATT = voids[CE]
+                posttext = OT[ESE-FSS:]
+                if VPATT.search(f"{CE} {posttext}"):
+                    # this is a voidable catch
+                    new_locs['_triggered'] = True
+                    new_locs['New_Entity'] = ''
+                    not_voided = False
 
-    # combine the singles and doubles into one dict since they are checked in the same way
-    post_loop = {**sgl_post_loop, **dbl_post_loop}
-    pre_loop = {**sgl_pre_loop, **dbl_pre_loop}
-    void_loop = {**sgl_void_loop, **dbl_void_loop}
+            PRE = None
+            POST = None
+            if CE in CPatts:
+                PRE = CPatts[CE]['PRE']
+                POST = CPatts[CE]['POST']                          
 
-    # in order to determine if an entity qualifies to be checked, it needs to be lowercased and stripped of simple punctuation
-    # make that a flag on the df so the pandas apply efficiency can be used    
-    RDF['FLAG_CHECK'] = RDF.extracted_entity.apply(lambda x: str(x).replace('.','').replace("-","").replace(",","").strip().lower())
+            if PRE and not_voided:
+                pretext = str(row['extracted_pre_5'])
+                attempt = PRE.extract_keywords(pretext, span_info=True)
+                if attempt:
+                    lpt = len(pretext)
+                    # if the match ends at the last 3 characters of the pre-string
+                    probables = [a for a in attempt if a[2] in [lpt, lpt-1, lpt-2]]
+                    if probables:
+                        # find the closest one to the end of the string
+                        m = sorted(probables, key=lambda tup: tup[2], reverse=True)[0]
+                        m_start = m[1]
 
-    # create the "hunting" dataframe of entities we will search through and check their neighborhoods
-    # use dict containment as the simple pandas efficient check to filter the DF
-    goodwill_hunting = RDF[RDF.FLAG_CHECK.isin(list(pre_loop.keys()) + list(post_loop.keys())+list(void_loop.keys()))]
+                        # if it is a match, then we need to reshuffle the entity using what matched from the pretext
+                        # match start + full span start gives the new entity start w.r.t to the full docket text
+                        new_ss = m_start+FSS
+                        new_ee = OT[m_start:ESE-FSS] # string of the new entity
+                        new_pre5 = OT[0:m_start] # new pretext
+                        # remapping data
+                        new_locs['_triggered'] = True
+                        new_locs['New_span_start'] = new_ss
+                        new_locs['New_pre_5'] =  new_pre5
+                        new_locs['New_Entity'] =  new_ee
 
-    # begin the process of checking each row.
-    # remapped will be where we store the new information
-    remapped = []
-    for index, row in tqdm.tqdm(goodwill_hunting.iterrows(), total=len(goodwill_hunting)):
+            if POST and not_voided:
+                # this does not get changes in new_locs in above control block, so no need to check
+                post_text = str(row['extracted_post_5'])
+                attempt = POST.extract_keywords(post_text, span_info=True)
+                if attempt:
+                    # if the match indexes at the first 3 characters of the posttext
+                    probables = [a for a in attempt if a[1] in [0,1,2]]
+                    # if pattern matched, respan using post tokens
+                    if probables:
+
+                        # this is likley going to find the longest match if eligible
+                        m = sorted(probables, key=lambda tup: tup[2], reverse=True)[0]
+                        m_end = m[2] # where the match ends in the post string
+
+                        # if we already ran pre-string adjustments
+                        if new_locs['_triggered']:
+                            ESS = new_locs['New_span_start']
+
+                        new_se = int(ESE + m_end+1)
+
+                        new_ee = OT[ESS-FSS:new_se-FSS]
+                        new_post5 = OT[new_se-FSS:]
+                        new_locs['_triggered'] = True
+                        new_locs['New_span_end'] =  new_se
+                        new_locs['New_Entity'] =  new_ee
+                        new_locs['New_post_5'] =  new_post5                   
+            # remap it
+            appy =  {
+                **lookup,
+                **new_locs
+            }
+            remapped.append(appy)    
+
+        REM = pd.DataFrame(remapped)
+        if REM.empty:
+            return REM
+        CHANGED = REM[REM._triggered==True]
         
-        # need keys to map the remapped entities to the original row (this is only done on the entries and not the headers df)
-        # the entries df is join safe because docket index is guaranteed to be non-null and the entity span starts cannot overlap from the spacy model
-        lookup = {'ucid':row['ucid'],
-                'docket_index':row['docket_index'],
-                'full_span_start': row['full_span_start'],
-                'Ent_span_start': row['Ent_span_start']}
+        return CHANGED
+
+    def _pattern_constructor(name: str, alts: list):
+        """Given a name and the alternative variants that include this name, 
+        return a tuple of Trie processors that are built to search forwards
+        and backwards for related name tokens that this name could be missing 
+
+        Args:
+            name (str): original extracted name
+            alts (list): alternative name variants that wholly encapsulate the name
+        Returns:
+            KeywordProcessor, KeyWordProcessor: returns Nones or Keyword Processor Tries for pattern detection
+        """
         
-        # every type of check will need the same base variables
-        # original text
-        OT = str(row['original_text'])
-        # span locations
-        FSS = row['full_span_start']
-        ESS = row['Ent_span_start']
-        ESE = row['Ent_span_end']
-        # transformed  entity string
-        elow = row['FLAG_CHECK']
+        def _expander(name: str, the_search: list, flag: str = 'preceding'):
+            """
+            Expand the search windows for the entities text
 
-        # where the entity starts in the original text
-        Enaught = ESS-FSS
-        # extract the pretext 
-        pretext = OT[0:Enaught]
-        # extract the posttext
-        posttext = OT[ESE-FSS:]
+            Args:
+                name (str): the originally extracted named entity
+                the_search (list): the list of possible preceding tokens that could preface this token or follow
+                flag (str, optional): is this for the preceding or following neighborhood. Defaults to 'preceding'.
 
-        go = True
-        if elow in pre_loop:
-            # if the entity qualifies to be checked
-            # take the regex patern and search it on the pretext
-            patt = pre_loop[elow]
-            m = patt.search(pretext)
-            if m:
-                # if it is a match, then we need to reshuffle the entity using what matched from the pretext
-                # match start + full span start gives the new entity start w.r.t to the full docket text
-                new_ss = m.start()+FSS
-                new_se = ESE # end is unchanged
-                new_ee = OT[m.start():ESE-FSS] # string of the new entity
-                new_pre5 = OT[0:m.start()] # new pretext
-                new_post5 = row['extracted_post_5'] # new posttext
-                # remapping data
-                remapped.append(
-                    {
-                        **lookup,
-                        'New_span_start':new_ss,
-                        'New_span_end': new_se,
-                        'New_pre_5': new_pre5,
-                        'New_Entity': new_ee,
-                        'New_post_5': new_post5
-                    }
-                )
-                go = False
-                continue  
+            Returns:
+                list: cleaned list of stringss that tries should be built from to search before the entity
+            """
+
+            strip_spaces = lambda x: x.strip()
+
+            # we are about to expand our search neighborhood using punctuation, spacing, etc.
+            # for example we have an original entity "Smith" and a preceding window saying "John Robert"
+            # our window will become "search for any of" [john robert, j.r., jr, etc.]
+            EXP = []
+            for each in the_search:
+                space_stripped =  strip_spaces(each)
+                tokens = space_stripped.split()
+
+                if not space_stripped:
+                    continue
+
+                # try adding periods after single letters
+                perio = " ".join([f"{t}." if len(t)==1 else t for t in tokens])
+                EXP.append(perio)
+                
+                fuze_periods = re.sub(r'(?<=\s[a-z]\.)\s(?=[a-z]\.)','',perio,flags=re.I)
+                EXP.append(fuze_periods)
+                
+                fuze_singulars = re.sub(r'(?<=\s[a-z])\s(?=[a-z]\s)','',space_stripped,flags=re.I)
+                EXP.append(fuze_singulars)
+
+                if flag == 'preceding':
+                    EXP.append(space_stripped)
+                    # remove middle inits
+                    if len(tokens)>1:
+                        trial = f"{tokens[0]} {' '.join(t for t in tokens[1:] if len(t)>1)}"
+                        if trial:
+                            EXP.append(trial)
+
+                if flag == 'following':
+                    # void bad William matches asap
+                    if name == 'will' and each[0:4]=='iam ':
+                        continue
+
+                    EXP.append(space_stripped)
+
+                    # remove a middle initial if applicable
+                    if len(tokens)>1:
+                        trial = f"{' '.join(t for t in tokens[0:-1] if len(t)>1)} {tokens[-1]} "
+                        if trial:
+                            EXP.append(trial)
+
+                    # if the first token is a suffix, add the comma and period
+                    if tokens[0] in JG.suffixes_titles:
+                        EXP.append(f", {space_stripped}")
+                        EXP.append(f", {space_stripped}.")
+                    
+                    # if the last token is a suffix, add in a comma and period
+                    if tokens[-1] in JG.suffixes_titles:
+                        EXP.append(f"{space_stripped}.")
+                        EXP.append(f"{' '.join(tokens[0:-1])}, {tokens[-1]}")
+                        EXP.append(f"{' '.join(tokens[0:-1])}, {tokens[-1]}.")
+
+
+            with_commas = []
+            if 'preceding' and name in JG.suffixes_titles:
+                with_commas = [f"{each}," for each in EXP]
+
+            clean_out = list(set([strip_spaces(n) for n in with_commas+EXP]))
+            return clean_out
         
-        if go and elow in post_loop:
-            # if the entity hasn't already been remapped (go=True still)
-            # if the entity qualifies to be checked for post neighborhoods
-            # grab pattern and check
-            patt = post_loop[elow]
-            m = patt.search(posttext)
-            if m:
-                # if pattern matched, respan using post tokens
-                new_ss = ESS
-                new_se = ESE + m.end()
-                new_ee = OT[ESS-FSS:new_se-FSS]
-                new_pre5 = row['extracted_pre_5']
-                new_post5 = OT[new_se-FSS:]
-                remapped.append(
-                    {
-                        **lookup,
-                        'New_span_start':new_ss,
-                        'New_span_end': new_se,
-                        'New_pre_5': new_pre5,
-                        'New_Entity': new_ee,
-                        'New_post_5': new_post5
-                    }
-                )
-                go = False
-                continue   
+        nl = len(name)
+        nls = len(name.split())
 
-        if go and elow in void_loop:
-            # if the entity hasn't already been remapped (go=True still)
-            # if the entity qualifies to be checked for void tokens
-            # grab pattern and check
-            patt = void_loop[elow]
-            m = patt.search(elow+' '+posttext)
-            if m:
-                # if it is voidable, rewrite the entity to empty string. 
-                # nothing else really matters since we'll throw it out
-                remapped.append(
-                    {
-                        **lookup,
-                        'New_span_start':row['Ent_span_start'],
-                        'New_span_end': row['Ent_span_end'],
-                        'New_pre_5': row['extracted_pre_5'],
-                        'New_Entity': '',
-                        'New_post_5': row['extracted_post_5']
-                    }
-                )
-                go = False
-                continue   
- 
+        build_preceding_search = []
+        build_following_search = []
+        for alt in alts:
+            # if the alternative variant ends with this extraction
+            if alt[-nl:] == name:
+                # add the preceding string portion as eligible preceding text
+                build_preceding_search.append(alt[0:-nl])
+            # if the alternative variant starts with this extraction
+            elif alt[0:nl] == name:
+                # the following text is remaining
+                follows = alt[nl:]            
+                # these are all bunk, bypass
+                if follows.strip() in ['as','by','from','to','presentence', 'standing']:
+                    continue
+                # if the name was possessive or ended in s and the other option is a possessive apostrophe
+                if name[-1] == 's' and follows[0:2] == "' ":
+                    continue
+                # if the alternative is just a tacked on possesive s, move on and ignore
+                if follows[0:2] in ['s ']:
+                    continue
+                # any of these are also bad, goodbye
+                if follows[0:3] in ['as ','by ','to ',"'s "]:
+                    continue
+                # hey if you made it here, you are a valid, eligible piece of text following the original extraction
+                build_following_search.append(alt[nl:])
+            # else conditions mean the extraction is in the middle of one of the name variations
+            else:
+                splat = alt.split()
+                nsplat = name.split()
+                # if the name is one token, and it is in the final token of the alternative name
+                # we continue
+                # this voids possessive matches like "thompson" being in "Dave Thompsons" and creating a weird
+                # "look for Dave preceding and 'S' following"
+                if nls <=2 and nsplat[-1] in splat[-1] and nsplat[-1]!=splat[-1]:
+                    continue
+                            
+                ai = alt.index(name)
+                pre = alt[0:ai]
+                post = alt[ai+nl:]
+                if pre[-1] ==' ':
+                    build_preceding_search.append(pre)
+                if post[0] == ' ':
+                    build_following_search.append(post)
+        
+        BPS = _expander(name, build_preceding_search, 'preceding')
+        BFS = _expander(name, build_following_search, 'following')
+                
+        BPTrie = None
+        BFTrie = None
+        if BPS:
+            BPTrie = KeywordProcessor(case_sensitive=False)
+            BPTrie.add_keywords_from_list(BPS)
+        if BFS:
+            BFTrie = KeywordProcessor(case_sensitive=False)
+            BFTrie.add_keywords_from_list(BFS)
+        
+        return BPTrie, BFTrie
+                
+    def _pre_clean(text: str):
+        """Custom cleaning function that standardizes extracted name strings for punctuation and casing
+
+        Args:
+            text (str): extracted entity string
+
+        Returns:
+            text: cleaned form of the entity
+        """
+        
+        # if somehow only numbers were extracted, guarantee we have a string to work with for the rest of this function
+        text = str(text)
+        
+        # remove leading periods
+        m = re.search(r'^(\s*)(\.+)(\s*)', text)
+        if m:
+            text = text[m.end():]
+        # remove beginning of string to or by or from, specifically followed by a space or bound
+        m = re.search(r'^(\s*)(by|to|from)(\s+|\b)', text, flags=re.I)
+        if m:
+            text = text[m.end():]
+        
+        # leading and trailing .-\' and 's
+        b = re.search(r'([\.\\\'\-]+)$|(\'s)$', text, flags=re.I)
+        f = re.search(r'^([\.\\\'\-]+)', text, flags=re.I)
+        if b:
+            text = text[0:b.start()]
+        if f:
+            text = text[f.end():]
+        
+        # strip all periods and hyphens
+        text = text.lower().replace('.','').replace('-',' ').replace(',','')
+        
+        # create uniform spacing
+        text = " ".join(text.lower().split())
+        
+        # remove re and us. These proved to be weirdos that lingered and had been extracted
+        if text in ['re','us','n/a','as','to','from','by'] or text=='':
+            return None
+        
+        return text
+
+    ###########################################
+    ###########################################
+    ### BEGINNING OF FUNCTION AFTER HELPERS ###
+    ###########################################
+    ###########################################
     
-    # make the remappings into a DF
-    REM = pd.DataFrame(remapped)
-    # set a flag on these rows to indicate we should use their newly remapped entities
-    REM['INCOMING'] = True
+    # names that we include manual overrids for because the model always failed to grab them
+    manual_overrides = {
+        'gud':['joaquin ve manibusan jr', 'joaquin v e manibusan jr'],
+        'insd':["joseph s van bokkelen"],
+        'flmd': ["mark l van valkenburgh"],
+        'kyed':["gregory f van tatenhove", "gregory f vantatenhove"],
+        'txed': ["james van valkenberg"]
+    }
 
-    # merge the remappings onto the original input DF, using the lookup values
-    NDF = RDF.merge(REM, how='left', on = ['ucid', 'docket_index', 'full_span_start', 'Ent_span_start'])
+    # known corpora of words that come after will that indicate Will is not a Proper Noun and is such is voidable as an entity
+    voids = {'will': re.compile(r'will(\s|\b)+(address|adjust|adopt|appear|appoint|be |consider|continue|convene|coordinate|decide|defer|determine|either|enter|establish|extend|further|handle|have|hear |hold |issue|make|necessarily|not |preside|promptly|recommend|rely|remain|review|rule|save|schedule(d)?|set|sign|take|the|upon|update)', flags=re.I)}
 
-    # log discrepancies before we overwrite them
-    JU.log_message(">>Token Neighborhood Search for Corrective Entity Extraction")
-    for index, row in NDF[NDF.INCOMING==True].iterrows():
-        ucid = str(row['ucid'])
-        di = str(row['docket_index'])
-        ot = str(row['original_text'])
-        old_ent = str(row['extracted_entity'])
-        new_ent = str(row['New_Entity'])
-        JU.log_message(f"{ucid:25} | {di} | {old_ent:25} --> {new_ent:25} | FROM: {ot}")
+    # on the input dataframe, map the original extracted entity to its cleaned name form
+    # i.e. J.R. Smith and JR Smith both now map to jr smith
+    cleansed_map = {n: _pre_clean(n) for n in RDF.extracted_entity.unique().tolist()}
+    RDF['CLEANSED_ENTITY'] = RDF.extracted_entity.map(cleansed_map)
+
+    # create a court level grouping of the cleaned entities
+    court_ee = defaultdict(list)
+    for court, cleansed in RDF[['court','CLEANSED_ENTITY']].drop_duplicates().to_numpy():
+        if cleansed:
+            court_ee[court].append(cleansed)
+ 
+    # if we can leverage prior JEL entities, let's
+    if len(JEL)>0:
+        JEL_names = JEL.name.unique()
+        JEL_Adds = [_pre_clean(n) for n in JEL_names]
+        for court, names in court_ee.items():
+            court_ee[court] = names
+            court_ee[court] += JEL_Adds
+
+    # the alternatives come from our manual overrides, add them in their respective courts
+    ELIGIBLE_ALTS = []
+    for court, names in manual_overrides.items():
+        for n in names:
+            cleansed = _pre_clean(n)
+            court_ee[court].append(cleansed)
+            ELIGIBLE_ALTS.append(cleansed)
+
+    # after pre_cleaning, it's possible to reduce some of them as they are identical. Leverage set method
+    court_ee = {k:set(v) for k,v in court_ee.items()}
+
+    # for the cleaned entities, add all of them to the eligible alternatives if it appeared more than 25 times
+    ELIGIBLE_ALTS+= [k for k,v in dict(RDF.CLEANSED_ENTITY.value_counts()).items() if v>25]
+
+    # for a given court at a time
+    COURT_PATTERNS = {}
+    for COURT, NAMES in tqdm.tqdm(court_ee.items()):
+        COURT_PATTERNS[COURT] = {}
+        # for every name in the court
+        for name in NAMES:
+            # first barrier to passing criteria for a "valid entity"
+            # cant be numbers and cannot be a single letter
+            if re.search(r'^[\d]+$', name) or len(name)==1:
+                continue
+            # if the extracted entity was 2 tokens or less, let's double check the neighboring tokens in case we can expand the extraction
+            if len(name.split())<=2:
+                # alternative options are any names that fully encapsulate this name
+                # for example: name = joaquin a, and an eligible alt is "joaquin a manibusan"
+                alts = [i for i in ELIGIBLE_ALTS if name in i and name!=i and len(i.split())>=2]
+                # make sure the algorithmically generated alts did not have judge or magistrate in them
+                # otherwise we could accidentally open the window to honorifics
+                alts = [a for a in alts if not any(pre in a for pre in ['judge','magistrate'])]
+                if alts:
+                    # determine all possible preceding and following tokens that should be searched for on this extraction
+                    Preceding, Following = _pattern_constructor(name, alts)
+                    if not Preceding and not Following:
+                        continue
+                    # if there were any, add them to the map
+                    COURT_PATTERNS[COURT][name] = {'PRE':Preceding, 'POST': Following}
+    
+    all_RDFs = []
+    # we will only cycle through entities we know we have a search neighborhood for
+    # go court by court and make a df for each if any reshuflle
+    for this_court, CPatts in tqdm.tqdm(COURT_PATTERNS.items()):
+        search_eligible = list(CPatts.keys()) + list(voids.keys())
+        this_subset = RDF[
+            (RDF.CLEANSED_ENTITY.isin(search_eligible)) &
+            (RDF.court==this_court)
+        ]
+        temp_rdf = _reshuffle_subset(this_subset, CPatts, voids)
+        if temp_rdf.empty:
+            continue
+        all_RDFs.append(temp_rdf)
+
+    # if we actually found remappings, go through with all of the merge processing now
+    if all_RDFs:
+        resh = pd.concat(all_RDFs)
+        NDF = RDF.merge(resh,
+                    how='left',
+                    on = ['ucid', 'docket_index', 'full_span_start', 'Ent_span_start'])
+        if "_triggered" not in NDF.columns:
+            NDF["_triggered"] = False
+        # log discrepancies before we overwrite them
+        JU.log_message(">>Token Neighborhood Search for Corrective Entity Extraction")
+        for index, row in NDF[NDF._triggered==True].iterrows():
+            ucid = str(row['ucid'])
+            di = str(row['docket_index'])
+            ot = str(row['original_text'])
+            old_ent = str(row['extracted_entity'])
+            new_ent = str(row['New_Entity'])
+            JU.log_message(f"{ucid:25} | {di} | {old_ent:25} --> {new_ent:25} \t| FROM: {ot}")
 
 
-    # if the entity got remapped, it would be flagged as INCOMING
-    # for those rows, overwrite the extracted entity information fields
-    NDF.loc[NDF.INCOMING==True, 'Ent_span_start'] = NDF['New_span_start']
-    NDF.loc[NDF.INCOMING==True, 'Ent_span_end'] = NDF['New_span_end']
-    NDF.loc[NDF.INCOMING==True, 'extracted_pre_5'] = NDF['New_pre_5']
-    NDF.loc[NDF.INCOMING==True, 'extracted_entity'] = NDF['New_Entity']
-    NDF.loc[NDF.INCOMING==True, 'extracted_post_5'] = NDF['New_post_5']
+        # if the entity got remapped, it would be flagged as _triggered
+        # for those rows, overwrite the extracted entity information fields
+        NDF.loc[NDF._triggered==True, 'Ent_span_start'] = NDF['New_span_start']
+        NDF.loc[NDF._triggered==True, 'Ent_span_end'] = NDF['New_span_end']
+        NDF.loc[NDF._triggered==True, 'extracted_pre_5'] = NDF['New_pre_5']
+        NDF.loc[NDF._triggered==True, 'extracted_entity'] = NDF['New_Entity']
+        NDF.loc[NDF._triggered==True, 'extracted_post_5'] = NDF['New_post_5']
 
-    # drop my custom columns used in this function, wont need them anymore
-    NDF.drop(['New_span_start', 'New_span_end','New_pre_5','New_Entity','New_post_5','FLAG_CHECK'], inplace = True, axis=1)
+        # drop my custom columns used in this function, wont need them anymore
+        NDF.drop(
+            ['New_span_start', 'New_span_end','New_pre_5','New_Entity','New_post_5',
+            '_triggered','CLEANSED_ENTITY'], inplace = True, axis=1)
 
-    return NDF
+        return NDF
+    else:
+        # if no changes happened, return the oirginal dataframe
+        return RDF
 
-def eligibility(df, colname_to_check='extracted_entity'):
+def eligibility(df: pd.DataFrame, colname_to_check: str='extracted_entity'):
     """eligibility function that runs through a dataframe and determines what rows to filter out for exclusion in disambiguation
 
     Args:
@@ -666,7 +790,7 @@ def eligibility(df, colname_to_check='extracted_entity'):
         pandas.DataFrame: df of eligible sel rows for disambiguation (filtered out ineligible rows)
     """
 
-    def _judges_in_pref(x):
+    def _judges_in_pref(x: str):
         """simple substring check for the plural of judge
 
         Args:
@@ -677,7 +801,7 @@ def eligibility(df, colname_to_check='extracted_entity'):
         """
         return 'judges' in str(x).lower()
 
-    def _not_comma_suffix(x):
+    def _not_comma_suffix(x: str):
         """ custom function to check if an entity string has a comma followed by a non-suffix word. Presumably we should cut these entities with weird commas
 
         Args:
@@ -711,7 +835,7 @@ def eligibility(df, colname_to_check='extracted_entity'):
             df.loc[(df.extracted_pre_5.apply(_judges_in_pref)) &
                    (df.extracted_entity.apply(_not_comma_suffix)), 'is_exception'] = True
     
-    # if the entity column we are checking is not null and this row was not a flagged exception --> eligibility is now false
+    # if the entity column we are checking is null and this row was not a flagged exception --> eligibility is now false
     df.loc[(df[colname_to_check].isna())&(~df.is_exception), 'eligible'] = False
     # if it is now a single letter entity --> eligibility is now false (We cannot match single letter names)
     df.loc[df[colname_to_check].apply(lambda x: len(str(x))<=1), 'eligible'] = False
@@ -723,7 +847,7 @@ def eligibility(df, colname_to_check='extracted_entity'):
     return df
 
 
-def apply_respanning(df, is_header=False):
+def apply_respanning(df: pd.DataFrame, is_header: bool=False):
     """Once an entity has been cleaned, respan the location in the text so that it is updated to reflect the cleaned entity
 
     Args:
@@ -781,17 +905,17 @@ def apply_respanning(df, is_header=False):
     
     return wf
 
-def handle_exception_entities(df, is_header=False):
+def handle_exception_entities(df: pd.DataFrame):
     """specialty function to handle known special entity strings or to handle plural judge entities
 
     Args:
         df (pandas.DataFrame): full dataframe of eligible rows for disambiguation
-        is_header (bool, optional): is this a df of header entities or not (entry). Defaults to False.
 
     Returns:
         pandas.DataFrame/list: DF of updated exception SEL rows or an empty list if no exceptions were handled
     """
     # known entities the model picks out that are weird exception cases
+    # the honorifics somehow land in the middle of the entity name, and obviously require a special cleaning method
     specials =["Edward B. Judge Atkins",
     "Elaine E. - MagJud Bucklo",
      "Rebecca R.- MagJud Pallmeyer", 
@@ -803,6 +927,7 @@ def handle_exception_entities(df, is_header=False):
      "Naomi R. (Magistrate) Buchwald on 10/",
      "Thomas J. Judge Rueter"]
 
+    ## these were cases where the NER extracted them, but the neighboring text makes them one-off outliers
     # comma separated dual judge entities
     comm_sep = ["Cassady, Bivens", "Hartz, Matheson"]
     # specialty weird entities
@@ -901,7 +1026,7 @@ def handle_exception_entities(df, is_header=False):
                 new['Ent_span_end'] = new['Ent_span_start']+ new_span_start + new_span_length
                 out_rows.append(new)
                 EE = EE[m.end():]
-            # again after the while loop if it was entered (passed) then we have one finally entity trailing to capture
+            # again after the while loop if it was entered (passed) then we have one final entity trailing to capture
             if EE and passed:
                 new_entity = EE
                 new_span_start = star
@@ -933,7 +1058,7 @@ def handle_exception_entities(df, is_header=False):
     else:
          return []
 
-def prefix_categorization(df, is_header = False):
+def prefix_categorization(df: pd.DataFrame, is_header: bool = False):
     """Given pretext preceding an entity, attempt to categorize it into one of our existing
     mutually exclusive buckets.
 
@@ -950,7 +1075,7 @@ def prefix_categorization(df, is_header = False):
         (JG.ND_TRIE,'Nondescript_Judge'),
         (JG.JA_TRIE, 'Judicial_Actor')
     ]
-    def _try_patts(each):
+    def _try_patts(each: str):
         """Local function used to try a trie-based search pattern on prefix text
 
         Args:
@@ -976,7 +1101,7 @@ def prefix_categorization(df, is_header = False):
 
     # verbiage check if the words transferred to or from surround the entity
     _transferred_patt = re.compile(r'[\b\s^](transferred|(re)?assigned)( (to|from))[\b\s$]', flags=re.I)
-    def _determine_transfer(each):
+    def _determine_transfer(each: str):
         """call the transferring pattern above on a string
 
         Args:
@@ -1011,7 +1136,7 @@ def prefix_categorization(df, is_header = False):
 
     return df
 
-def string_cleaning_hierarchy(each):
+def string_cleaning_hierarchy(each: str):
     """stacked cleaning function that iterates through an entity string and identifies if parts of it need to be shaved off the front or back. 
     The order of execution is important in this function. Inserting new cleaning patterns should be okay, but be careful rearranging existing ones.
 
@@ -1039,8 +1164,19 @@ def string_cleaning_hierarchy(each):
     # middle patterns are patterns that we expect to detect after a judge's name, so strip at the beginning
     # of them if we find them
     m = JG.mpp.search(each)
-    if m:
+    if m and m.start() not in range(0,5):
         each = each[0:m.start()]
+
+    # if a number or punctuation is all at the beginning or end
+    m = JG.num_punct_start.search(each)
+    if m:
+        each = each[m.end():]
+
+    # if a . or [ now starts the string
+    m = re.search(r'^(\.|\[)',each)
+    if m:
+        each = each[m.end():]
+    
 
     # lots of crazy potential docket punctuation patterns
     mepatts=[".*",".:",".;",'.)',".(",'.[',".'",".-",".=",". (",
@@ -1109,7 +1245,7 @@ def string_cleaning_hierarchy(each):
     
     # large corpus of possible single token words or multitoken word patterns that appeared alongside or as entities
     m = JG.wopat.search(each)
-    if m:
+    if m:# and m.start() not in range(3):
         each = each[0:m.start()]
     # words that must be searched specifically as the final word in a pattern
     m = JG.single_back_patt.search(each.strip())
@@ -1225,7 +1361,7 @@ def string_cleaning_hierarchy(each):
 
     return each, exceptions
 
-def stacked_cleaning(testname):
+def stacked_cleaning(testname: str):
     """This cleaning is performed at the beginning of disambiguation. 
     It levels the disambiguation playing field omitting punctuation, omitting possessive s and does other similar things
 
@@ -1262,3 +1398,102 @@ def stacked_cleaning(testname):
     
     # join split omits any funky double spaces
     return ' '.join(testname.lower().split())
+
+
+def cast_as_entry_model(row: dict):
+    """Given a row of json data from a SEL file, cast it into the disambiguation data model
+
+    Args:
+        row (dict): SEL data loaded in from a jsonL file, this should be an encapsulated valid json
+
+    Returns:
+        dict: the original data, but now cast into the properly keyed data model
+    """
+    ot = row['original_text']
+    scaled_ent_start = int(row['Entity_Span_Start'] - row['full_span_start'])
+    scaled_ent_end = int(row['Entity_Span_End'] - row['full_span_start'])
+
+    # need to generate text before and after the entity
+    pretext = ot[0:scaled_ent_start]
+    posttext = ot[scaled_ent_end:]
+    
+    out = {
+        'ucid': row['ucid'],
+        'court': row['court'],
+        'year': row['year'],
+        'cid': row['cid'],
+        'docket_index': row['docket_index'],
+        'entry_date': '',
+        'original_text': row['original_text'],
+        'full_span_start': int(row['full_span_start']),
+        'full_span_end': int(row['full_span_end']),
+        'extracted_pre_5': pretext,
+        'extracted_entity': row['Extracted_Entity'],
+        'extracted_post_5': posttext,
+        'Ent_span_start': int(row['Entity_Span_Start']),
+        'Ent_span_end': int(row['Entity_Span_End']),
+        'docket_source': row['docket_source'],
+        'Entity_Extraction_Method': row['Entity_Extraction_Method']
+    }
+    return out
+
+
+def cast_as_heads_model(row: dict):
+    """Given a row of json data from a SEL file, cast it into the disambiguation data model
+
+    Args:
+        row (dict): SEL data loaded in from a jsonL file, this should be an encapsulated valid json
+
+    Returns:
+        dict: the original data, but now cast into the properly keyed data model
+    """
+    ot = row['original_text']
+    scaled_ent_start = int(row['Entity_Span_Start'] - row['full_span_start'])
+    # only need to generate text before the entity for header data
+    pretext = ot[0:scaled_ent_start]
+
+    out = {
+        'ucid': row['ucid'],
+        'court': row['court'],
+        'cid': row['cid'],
+        'year': row['year'],
+        'filing_date': '',
+        'original_text': row['original_text'],
+        'extracted_pretext': pretext,
+        'extracted_entity': row['Extracted_Entity'],
+        'Ent_span_start': int(row['Entity_Span_Start']),
+        'Ent_span_end': int(row['Entity_Span_End']),
+        'Pre_span_start': row['full_span_start'],
+        'Pre_span_end': row['Entity_Span_Start']-1,
+        'docket_source': row['docket_source'], 
+        'Entity_Extraction_Method': row['Entity_Extraction_Method'],
+        'judge_enum': row['judge_enum'],
+        'party_enum': row['party_enum'],
+        'pacer_id': row['pacer_id'],
+        'docket_index': row['docket_index']
+    }
+    return out
+
+    
+def Transform_SEL_to_Disambiguation_Data_Model(old_Inconclusive_Data: list):
+    """Given a list of jsons/dicts loaded in from prior SEL files, transform them into
+    the disambiguation data model so they can be reconsidered during disambiguation
+
+    Args:
+        old_Inconclusive_Data (list): valid jsons loaded from SEL jsonLs
+
+    Returns:
+        pandas.DataFrame, pandas.DataFrame: the remodelled data for line entries and header entities
+    """
+    as_raw_lines = []
+    as_raw_heads = []
+    for row in old_Inconclusive_Data:
+        if row['docket_source'] == 'line_entry':
+            as_raw_lines.append(cast_as_entry_model(row))
+        else:
+            as_raw_heads.append(cast_as_heads_model(row))
+            
+    old_entries = pd.DataFrame(as_raw_lines)
+    old_heads = pd.DataFrame(as_raw_heads)
+
+    return old_entries, old_heads

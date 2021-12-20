@@ -251,7 +251,7 @@ def convert_sas7(infile, outfile=None, dir=None, n_rows=None):
                         break
 
 
-def split_txt(old_file, out_dir, case_type, year_lb, nrows=None):
+def split_txt(old_file, out_dir, case_type, year_lb=0, nrows=None, year_var='DOCKET'):
     '''
     Cut one of the large .txt tab-delimited IDB datasets into multiple csv files, by year.
 
@@ -261,6 +261,7 @@ def split_txt(old_file, out_dir, case_type, year_lb, nrows=None):
         - case_type ('cv' or 'cr')
         - year_lb (int): lower bound on year, to filter out rows with filedate below
         - nrows (int): max number of rows to write (for testing small samples)
+        - year_var ('DOCKET', 'FILEDATE'): which IDB varibale to get the year from (for file splitting)
     '''
 
     # Create directory if it doesn't exist
@@ -272,7 +273,6 @@ def split_txt(old_file, out_dir, case_type, year_lb, nrows=None):
         # Get the column headers from the first line
         columns = rfile.readline().rstrip('\n').split('\t')
         ind_filedate = columns.index('FILEDATE')
-
         write_count = 0
 
         # Session dictionary to map year to open csv writers
@@ -286,18 +286,29 @@ def split_txt(old_file, out_dir, case_type, year_lb, nrows=None):
                 continue
 
             # Filter by year lower bound
-            year = int(row[ind_filedate].split('/')[-1])
-            if year < year_lb:
+            file_year = int(row[ind_filedate].split('/')[-1])
+            if file_year < year_lb:
                 continue
 
+            if year_var=='FILEDATE':
+                split_year = file_year
+
+            elif year_var=='DOCKET':
+                # Use the year from the DOCKET variable e.g.g 1600001 -> 16
+                ind_docket = columns.index('DOCKET')
+                split_year = row[ind_docket][:2]
+            else:
+                raise ValueError("`year_var` must be in ('FILEDATE','DOCKET')")
+
+
             # Check if we have a csv for 'year' and if not, start it up
-            if year not in session.keys():
-                filepath = out_dir/f"{case_type}{year}.csv"
-                session[year] = {'file': open(filepath, 'w', encoding="utf-8",
+            if split_year not in session.keys():
+                filepath = out_dir/f"{case_type}{split_year}.csv"
+                session[split_year] = {'file': open(filepath, 'w', encoding="utf-8",
                                                 newline='\n')}
-                session[year]['writer'] = csv.writer(session[year]['file'])
+                session[split_year]['writer'] = csv.writer(session[split_year]['file'])
                 # Write the header row for this new file
-                session[year]['writer'].writerow(['ucid','ucid_weak', *columns])
+                session[split_year]['writer'].writerow(['ucid','ucid_weak', *columns])
 
             # Find the ucid and weak_ucid
             data = {k:row[columns.index(k)] for k in ['DOCKET', 'DISTRICT', 'OFFICE']}
@@ -308,7 +319,7 @@ def split_txt(old_file, out_dir, case_type, year_lb, nrows=None):
             ucid_weak = dtools.get_ucid_weak(ucid)
 
             # Write the new row, which is (ucid, ucid_weak, <<original row data>>)
-            session[year]['writer'].writerow([ucid,ucid_weak,*row])
+            session[split_year]['writer'].writerow([ucid,ucid_weak,*row])
 
             write_count += 1
             if nrows:
@@ -318,12 +329,14 @@ def split_txt(old_file, out_dir, case_type, year_lb, nrows=None):
     for v in session.values():
         v['file'].close()
 
-def idb_merge(idb_data_file, case_type, dframe=None):
+def idb_merge(idb_data_file, case_type, preloaded_idb_data_file=None, dframe=None):
     '''
     Merge dataframe of cases with idb data
 
     Inputs
         - idb_data_file (str or Path): the idb csv file to use e.g. 'cv10to19.csv'
+        - case_type (str): the case type ('cv' or 'cr') of the cases in the idb file provided
+        - preloaded_idb_data_file (DataFrame): specify a preloaded IDB dataframe, e.g. if the consumer has already called load_idb_csv
         - dframe (DataFrame): specify table of case files, instead of using all of unique files table
     Outputs
         - final (DataFrame): the merged table
@@ -341,8 +354,11 @@ def idb_merge(idb_data_file, case_type, dframe=None):
     dff.reset_index(inplace=True)
     dff['ucid_copy'] = dff['ucid'].copy()
 
-    print(f'Loading idb file: {idb_data_file}...')
-    df_idb = load_idb_csv(idb_data_file, case_type=case_type, cols=BARE_MIN_COLS)
+    if preloaded_idb_data_file is not None:
+        df_idb = preloaded_idb_data_file
+    else:
+        print(f'Loading idb file: {idb_data_file}...')
+        df_idb = load_idb_csv(idb_data_file, case_type=case_type, cols=BARE_MIN_COLS)
     df_idb.sort_values(['ucid', 'filedate'], inplace=True)
     df_idb.drop_duplicates('ucid', keep='first', inplace=True)
 
@@ -353,6 +369,8 @@ def idb_merge(idb_data_file, case_type, dframe=None):
     keepcols = ['fpath', 'case_type', 'filing_date', 'terminating_date', 'source',
                 *[x.lower() for x in BARE_MIN_COLS]]
                  # *[x.lower() for x in get_recap_idb_cols(case_type)] ]
+    if 'nos_subtype' in dff.columns:
+        keepcols.append('nos_subtype')
 
     # Make table of data merged on ucid
     print(f'STAGE 1: merging...')

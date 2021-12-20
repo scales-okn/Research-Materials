@@ -7,152 +7,36 @@ import pandas as pd
 
 import JED_Globals_public as JG
 import JED_Cleaning_Functions_public as JCF
-import JED_Classes_public as JClasses
+import JED_Classes_public as JCL
 import JED_Utilities_public as JU
 
-
-#######################
-## Updating Function ##
-#######################
-
-def assess_new_cases(Post_UCID, Compy_JEL):
-    """Given a DF of new cases to disambiguate for entities, run a disambiguation against the existing JEL
-
-    Args:
-        Post_UCID (pandas.DataFrame): extracted entities from new cases
-        Compy_JEL (pandas.DataFrame): portion of the JEL containing active judges during the time period the new cases were active
-
-    Returns:
-        pandas.DataFrame: Pre-SEL like dataframe with attributed/matched judges
-    """
-    # list of entities that need to be mapped
-    needs_mapping = list(Post_UCID.Points_To.unique())
-    
-    # find the entities that are single token vs. multi
-    single_anchors = [e for e in needs_mapping if len(e.split())==1]
-    remainder = [e for e in needs_mapping if e not in single_anchors]
-
-    # build out objects for the new entities and the JEL entities
-    new_anchors = [JClasses.UPDATER_NODE(each) for each in single_anchors]
-    new_others = [JClasses.UPDATER_NODE(each) for each in remainder]
-    JEL_NODES = []
-    for name, sjid in Compy_JEL[['name','SJID']].to_numpy():
-        JEL_NODES.append(JClasses.JEL_NODE(name, sjid))
-
-    # for every multi-token name that needs to be matched
-    # compare it to existing JEL nodes
-    for each in tqdm.tqdm(new_others):
-
-        # if it has an exact spelling match, win early
-        matches = [o for o in JEL_NODES if o.name == each.name]
-        if len(matches)==1:
-            # assign the winner to this new entity
-            each.assign_SJID(matches[0].SJID)
-            continue
-
-        # if a match was not found, we are going to attempt to iterate through a tokens-in-tokens checking routine
-        # of this entity against JEL entities using various abbreviations and nickname stylings
-        for AF, AM, STYLE in [(False, False, 'Plain'), (False, True, 'Plain'),(True, False, 'Plain'), 
-                            (False, False, 'Unified'), (False, False, 'Nicknames'),
-                            (False, True, 'Nicknames')]:
-            # if it got mapped during this loop, break
-            if not each.eligible:
-                break
-            for JN in JEL_NODES:
-                # go thru every JEL node
-                # if this entity was mapped at some point, break out of this
-                if not each.eligible:
-                    break
-                # create the pool of comparison tokens
-                this_pool, that_pool = pool_creator(each, JN, 
-                                                    abbreviated_first=AF, abbreviated_middle=AM, style=STYLE)
-
-                # if the pool of tokens qualifies as a match, then assign the JEL SJID to this entity
-                if pool_runner(this_pool, that_pool):
-                    each.assign_SJID(JN.SJID)
-                    continue
-        
-        # if we got through all of the token in token checks with no match, let's attempt some fuzzy matches against known judges
-        for JN in JEL_NODES:
-            if not each.eligible:
-                break
-            if fuzz.ratio(each.name, JN.name)>90:
-                each.assign_SJID(JN.SJID)
-                continue
-            if fuzz.token_set_ratio(each.name, JN.name)>95:
-                each.assign_SJID(JN.SJID)
-                continue
-
-        # if this entity still doesnt have a match, we will try specialty naming conventions
-        # this block attempts matching a name like "John Robert Smith" to the known "J Robert Smith"
-        for JN in JEL_NODES:
-            if not each.eligible:
-                break
-            for inf_toks in each.inferred_tokens[False][True]:
-                if not each.eligible:
-                    break
-                for inf_tok_j in JN.inferred_tokens[False][True]:
-                    if not each.eligible:
-                        break
-                    if fuzz.ratio(inf_toks, inf_tok_j)>95:
-                        each.assign_SJID(JN.SJID)
-                        break
-    
-    # now for the single token entities
-    for each in new_anchors:
-        this_anchor = each.anchor
-        JAnchs = [JN for JN in JEL_NODES if JN.anchor==this_anchor]
-        # only if there is a single known JEL judge with the same last name will we attribute that judge to that SJID
-        if len(JAnchs)==1:
-            each.assign_SJID(JAnchs[0].SJID)
-
-        # otherwise we say it will remain inconclusive
-        elif len(JAnchs)>1:
-            each.assign_SJID('Inconclusive')
-
-    # any remaining unmarked entities will be ruled inconclusive
-    for each in [no for no in new_others if no.eligible]:
-        each.assign_SJID("Inconclusive")
-    for each in [na for na in new_anchors if na.eligible]:
-        each.assign_SJID("Inconclusive")
-
-    # now build out the map of new entities to their flagged SJID/"inconclusive" labels
-    finmap = {}
-    for each in new_others+new_anchors:
-        finmap[each.name] = each.SJID
-
-    # tack them on the row-by-row dataframe
-    Post_UCID['SJID'] = Post_UCID.Points_To.map(finmap)
-
-    return Post_UCID
 
 ##################################
 ## Final Intra-UCID Crosschecks ##
 ##################################
 
-def FINAL_CLEANUP(Fin_Matched, JEL):
-    """The end of the initial disambiguation process. This function takes a final dataframe with many entities disambiguated and
-    attempts to disambiguate a few more within a UCID with the confident disambiguated entities as priors.
+def FINAL_CLEANUP(PCID_Mappings: pd.DataFrame):
+    """Given the final disambiguation results, double check any remaining inconclusive entities cannot
+    be tagged to a known entity
 
     Args:
-        Fin_Matched (pandas.DataFrame): row-by-row data frame of entities with SJID tags now (some will be inconclusive)
-        JEL (pandas.DataFrame): df of confidently selected judge entities from our data
+        PCID_Mappings (pandas.DataFrame): final output DF the contains span columns, entity columns, point to entity columns, and an SJID tag
 
     Returns:
-        pandas.DataFrame: final output df of row-by-row entities with a few of the inconclusive entities now resolved
+        pandas.DataFrame: DF of the same input shape, with 0 to many updates on inconclusive entities
     """
-    print("\nFinal Cleanup: Crosschecking remaining inconclusive entities")
+    # I only need the unique list of entities by ucid to run through the final check
+    mapper_frame = PCID_Mappings[['ucid','extracted_entity','Points_To', 'SJID']].drop_duplicates()
 
-    # I only need the unqieu list of entities by ucid to run through the final check
-    mapper_frame = Fin_Matched[['ucid','extracted_entity','Final_Pointer', 'SJID']].drop_duplicates()
-    
-    # I will be building a map by ucid of all entities marked as good (known judge) or "inconclusive"
+    # I will be building a map by ucid of all entities marked as good (known judge with SJID) or "inconclusive"
     the_map = {}
+    # cleaned ent was the original extraction, final ent is the pointer or parent entity
     for ucid, cleaned_ent, final_ent, SJID in [tuple(x) for x in mapper_frame.to_numpy()]:
         has_sjid = True
         if SJID == 'Inconclusive':
             has_sjid = False
 
+        # note the ordering of the tuples flips them from when they come in
         if ucid not in the_map:
             if has_sjid:
                 the_map[ucid] = {"Good": [(final_ent, cleaned_ent, SJID)],"Inconclusive": []}
@@ -174,10 +58,12 @@ def FINAL_CLEANUP(Fin_Matched, JEL):
     # updater will track which inconclusive entities we were able to update and point towards an SJID
     updater = []
     for ucid, ents in tqdm.tqdm(review.items()):
+        # for every ucid, and each inconclusive entity
         for each in ents['Inconclusive']:
             badname = each[0] # the entity we will compare
             original = each[1] # what the entity originally looked like
             m_count = [] # match counter
+            # compare against the names of all the known SJID entities
             for good in ents['Good']:
                 goodname = good[0] # name of entity with sjid to compare
                 g_original = good[1] # original form of the entity
@@ -192,99 +78,422 @@ def FINAL_CLEANUP(Fin_Matched, JEL):
             if len(m_count)==1 and len([i for i in ents['Good'] if badname in i[0]])==1:
                 good = m_count[0]
                 updater.append({"ucid": ucid,
-                                "Final_Pointer": each[0],
+                                "Points_To": each[0],
                                 "New_Point": good[0],
                                 "New_SJID": good[2],
                                 "Absorb": True
-                               })
+                            })
     # build the DF for the updated mappings
-    RECAST = pd.DataFrame(updater)            
+    RECAST = pd.DataFrame(updater)  
+    RECAST.drop_duplicates(inplace=True)
     
-    # log what we updated
-    for each in updater:
-        JU.log_message(f"Final Crosscheck | {each['ucid']:25} |{each['Final_Pointer']:25} --> {each['New_Point']}")
+    # if there were remappings, we will need to merge them back onto the original DF
+    if not RECAST.empty:
+        # log what we updated
+        for each in updater:
+            JU.log_message(f"Final Crosscheck | {each['ucid']:25} |{each['Points_To']:25} --> {each['New_Point']}")
 
-    print("Completing final SEL merge")
-    # merge them together
-    FMDF = Fin_Matched.merge(RECAST, how='left', on = ['ucid','Final_Pointer'])
-    
-    # any of the update entities are marked with "Absorb" meaning we will overwrite their SJID (previously inconclusive) and their Final Parent entity (final pointer)
-    FMDF.loc[FMDF.Absorb==True, 'SJID'] = FMDF.New_SJID
-    FMDF.loc[FMDF.Absorb==True, 'Final_Pointer'] = FMDF.New_Point
-    
-    # drop misc columns created
-    FMDF.drop(['New_Point','New_SJID','Absorb'], axis=1, inplace=True)
+        print("Completing final SEL merge")
+        # merge them together
+        FMDF = PCID_Mappings.merge(RECAST, how='left', on = ['ucid','Points_To'])
+
+        # any of the update entities are marked with "Absorb" meaning we will overwrite their SJID (previously inconclusive) and their Final Parent entity (final pointer)
+        FMDF.loc[FMDF.Absorb==True, 'SJID'] = FMDF.New_SJID
+        FMDF.loc[FMDF.Absorb==True, 'Points_To'] = FMDF.New_Point
+
+        # drop misc columns created
+        FMDF.drop(['New_Point','New_SJID','Absorb'], axis=1, inplace=True)
+    else:
+        FMDF = PCID_Mappings
     
     return FMDF
 
-###################################
-## Specialty Crosswalk Functions ##
-###################################
+##############################
+## Free Matching Algorithms ##
+##############################
 
-def Abrams_Patch(NODES):
-    """We cannot perfectly match all names algorithmically. Notably: special nicknames or marital name changes require
-    a human knowledge level patch to account for in our code. This function is the shoehorn for those. It was originally
-    created to account for Judge Leslie Abrams, but has since been updated with more names
-
-    Args:
-        NODES (list): Freematch objects in middle of disambiguation
-
-    Returns:
-        list: same list of freematch objects that entered the function, but now a few point to each other
-    """
-    print("\nPipe: Free Matching; Marital Name Changes or Other Caveats")
-
-    # marital name change
-    abrams = ['leslie abrams gardner','leslie joyce abrams']
-    # some of the courts omit the accented a in roman due to computer error. Quite a lot of romn exists
-    romans = ['nelson s romn','nelson stephen roman']
-    # middle name is nicknamed and used as first name
-    biery = ["fred biery","samuel frederick biery jr"]
-    # first name nicknamed, middle initials unclear
-    sickle = ['fred van sickle', 'frederick l van sickle']
-    # middle name nickname used as first name
-    kinkeade = ['ed kinkeade', 'james e kinkeade']
-    # another J E Carnes exists, so checking EE Carnes fails
-    carnes = ['ed carnes', 'edward earl carnes']
-
-    specials = [abrams, romans, biery, sickle, kinkeade, carnes]
-
-    # for each of our special pool of names, we assume the list in the loop all maps to each other
-    # i.e. ed kinkeade will always collapse onto james e kinkeade
-    # we also believe these are the final 2 iterations of the names and no other possible name exists (although more could be added)
-    for specialty in specials:
-        # grab all of the nodes that match up for this pool of specialty name
-        Anodes = [n for n in NODES if n.name in specialty and n.eligible]
-        # while the pool of eligible nodes remains larger than 1, reduce them onto each other using our existing "winner" decision criteria
-        # TODO: choosing the most recent marital name as the "winning name"
-        check = [o for o in Anodes if o.eligible]
-        failsafe = 0
-        while len(check)>1 and failsafe<50:
-            failsafe+=1
-            Anodes[0].choose_winner(Anodes[1], "Abrams Patch")
-            check = [o for o in check if o.eligible]
-    
-    return NODES
-
-def PIPE_Free_Van_Sweep(NODES):
-    """Pipe for the Free-Matching phase of disambiguation.
-    This pipe focuses on natural language bias fixes for germanic entities whose names are like Van Kloet
+def PIPE_Free_Exact_Beginning(nodes: list):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match exactly to each other
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
 
     Args:
-        NODES (list): Freematch objects in middle of disambiguation
+        nodes (list): list of FreeMatch custom objects from JED_Classes
 
     Returns:
-        list: same list of freematch objects that entered the function, but now a few point to each other
+        list: list of the same objects that entered the function, with their parent/child connections updated
     """
-    print("\nPipe: Free Matching; 'Van' Name Sweeps")
     
-    # grab only the nodes where van is a token in the name
+    # we will only consider the nodes that remain eligible to be mapped to each other
+    eligible_nodes = [N for N in nodes if N.eligible]
+    
+    # we begin iteration at the beginning of the list
+    start = 0
+    # the iterables are the whole list
+    it_list = eligible_nodes[start:]
+
+    # while there remains entities in the list we haven't compared, keep going
+    while it_list:
+        # the beginning node we will compare too
+        this = eligible_nodes[start]
+        # the remaining peers to compare to it
+        those = eligible_nodes[start+1:]
+
+        # advance the parameters of our while loop for the next iteration
+        start+=1
+        it_list = eligible_nodes[start:]
+
+        # the search checks again for those that remain eligible
+        # it is possible one of the nodes was originally eligible upon creation of the it_list, but has since been mapped to another node
+        # and is now ineligible
+        search = [o for o in those if o.eligible]
+        # default to having no matched nodes
+        matches = []
+
+        # if there is a remaining list to search after eligibility checks, and this node remains eligible
+        if search and this.eligible:
+            # begin the search
+            for that in search:
+                # criterion: strings match exactly for their names
+                if that.name == this.name:
+                    # if satisfied, add it to the list of possible matches
+                    matches.append(that)
+
+        # if names were considered a match
+        if matches:
+            # run the ambiguity reduction method for the objects: this will either choose a winner or deem them ambiguous
+            this.assess_ambiguity(matches, 'Instant Exact Reduction','Free [1]')
+            ## BLOCK BELOW IS DEV TESTING BLOCK
+            # if not this.assess_ambiguity(matches,  'Instant Exact Reduction','Free [1]'):
+            #     print('failure')
+            #     print((this.name, this.courts, this.eligible, this.NID, this.BA_MAG_ID, this.serial_id, this.POINTS_TO_SID))
+            #     for m in matches:
+            #         print("--",(m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
+    
+    return nodes
+
+def PIPE_Free_Fuzzy_Pool_Based(nodes: list):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match by fuzzy standards
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
+
+    Args:
+        nodes (list): list of FreeMatch custom objects from JED_Classes
+
+    Returns:
+        list: list of the same objects that entered the function, with their parent/child connections updated
+    """
+
+    # we will only consider the nodes that remain eligible to be mapped to each other
+    eligible_nodes = [N for N in nodes if N.eligible]
+    
+    # we begin iteration at the beginning of the list
+    start = 0
+    # the iterables are the whole list
+    it_list = eligible_nodes[start:]
+
+    # while there remains entities in the list we haven't compared, keep going
+    while it_list:
+        this = eligible_nodes[start] # entity to compare
+        those = eligible_nodes[start+1:] # other entities to test
+        start+=1 # iterables
+        it_list = eligible_nodes[start:] # iterables
+
+        # only the eligible ones to compare (if an entity got mapped during an earlier iterated entity, we don't want to map to it)
+        search = [o for o in those if o.eligible]
+        matches = []
+
+        if search and this.eligible:
+            # this function does not handle single token entities, fuzzy matching on single tokens is bad
+            if this.token_length==1:
+                continue
+            for that in search:
+                # if the possible match is a single token, move on
+                if that.token_length==1:
+                    continue
+                # fuzzy match bound
+                bound = 95
+                # the full entity name needs to fuzzy match above this bound
+                if fuzz.ratio(this.name, that.name) >=bound:
+                    # consider it as a possible match
+                    matches.append(that)
+        # if possible matches were found
+        if matches:
+            # run the ambiguity reduction method for the objects: this will either choose a winner or deem them ambiguous
+            this.assess_ambiguity(matches, 'Free Fuzzy', 'Free [2]')
+            ## BLOCK BELOW IS DEV TESTING BLOCK
+            # if not this.assess_ambiguity(matches, 'Free Fuzzy', 'Free [2]'):
+            #     print('failure')
+            #     print((this.name, this.courts, this.eligible, this.NID, this.BA_MAG_ID, this.serial_id, this.POINTS_TO_SID))
+            #     for m in matches:
+            #         print("--",(m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
+    
+    return nodes
+
+def PIPE_Free_Tokens_in_Tokens_Pool_Based(nodes: list, abbreviated_first: bool, abbreviated_middle: bool, style: str):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match by token overlap standards
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
+
+    Args:
+        nodes (list): list of FreeMatch custom objects from JED_Classes
+        abbreviated_first (bool): should the first token be abbreviated
+        abbreviated_middle (bool): should the middle tokens be abbreviated
+        style (str): run the function on the plain string, nicknames of the strings, or unified spellings
+    """
+
+    # we will only consider the nodes that remain eligible to be mapped to each other
+    eligible_nodes = [N for N in nodes if N.eligible]
+    
+    # we begin iteration at the beginning of the list
+    start = 0
+    # the iterables are the whole list
+    it_list = eligible_nodes[start:]
+    while it_list:
+        this = eligible_nodes[start] # object to compare
+        those = eligible_nodes[start+1:] # objects to be compared
+
+        start+=1 # iterables
+        it_list = eligible_nodes[start:] # iterables
+
+        # function not equipped to handle single token entities.
+        # We DONT want to match Brown to Brown in freematching, since we dont know they are truly the same across courts
+        if this.token_length==1:
+            continue
+        
+         # only the eligible ones to compare (if an entity got mapped during an earlier iterated entity, we don't want to map to it)
+        search = [o for o in those if o.eligible]
+        matches = []
+
+        if search and this.eligible:
+            for that in search:
+                # again VETO single-token entities
+                if that.token_length==1:
+                    continue
+
+                # create a pool of tokens to use in comparison
+                # the pool is based on the abbreviation and string standardization style args
+                this_pool, that_pool = pool_creator(this, that, abbreviated_first, abbreviated_middle, style)
+
+                # run the pools against each other to determine if one pools tokens are entirely in the other
+                if pool_runner(this_pool, that_pool):
+                    # the pool runner is a bool for "Yes the tokens of one are in the other" or "No"
+                    # richard b should not match richard b jones -- too ambiguous
+                    # if the final regular token is one character, we will not consider the name variant
+                    if this.token_length==2: 
+                        if len(this.tokens_wo_suff[-1])==1:
+                            # important to consider the suffixless form because "James Smith I" could improperly trigger this
+                            continue
+                        # this is 2 tokens, that is 3+ tokens
+                        if that.token_length>2 and this.base_tokens[1] == that.base_tokens[1]:
+                            # make sure the last name is not the middle of another 
+                            # john thomas should not match john thomas coepenhaver
+                            continue
+                    # same logic but mirrored for the "that" name variant
+                    if that.token_length==2:
+                        if len(that.tokens_wo_suff[-1])==1:
+                            continue
+                        if this.token_length>2 and that.base_tokens[1] == this.base_tokens[1]:
+                            continue
+                    # if we did not continue above in exclusions, consider it a possible match
+                    matches.append(that)
+
+        # if there were presumed matches confirm there are no ambiguities
+        if matches:
+            # if the name variant we are considering matches for had a suffix, then reduce the matches to only names that had suffixes too
+            # note if James Smith III and James Smith are actually the same (and the latter is colloquially written sans suffix)... then
+            # ... during the James Smith III run, the match is voided, but it is reconsidered when the list is checking James Smith
+            if len(matches)>1 and this.suffix:
+                if any(m.suffix for m in matches):
+                    matches =[m for m in matches if m.suffix]
+            
+            this.assess_ambiguity(matches,  f'Free TIT-{int(abbreviated_first)}{int(abbreviated_middle)}-{style}', 'Free [3]')
+            ## BLOCK BELOW IS DEV TESTING BLOCK
+            # if not this.assess_ambiguity(matches,  f'Free TIT-{int(abbreviated_first)}{int(abbreviated_middle)}-{style}', 'Free [3]'):
+            #     print('failure')
+            #     print((this.name, this.courts, this.eligible, this.NID, this.BA_MAG_ID, this.serial_id, this.POINTS_TO_SID))
+            #     for m in matches:
+            #         print("--",(m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
+    return nodes
+        
+def PIPE_Free_Vacuum_Pool_Based(nodes: list):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match by "vacuumed out middle tokens" standards
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
+
+    Args:
+        nodes (list): list of FreeMatch custom objects from JED_Classes
+
+    Returns:
+        list: list of the same objects that entered the function, with their parent/child connections updated
+    """
+    # we will only consider the nodes that remain eligible to be mapped to each other
+    eligible_nodes = [N for N in nodes if N.eligible]
+    
+    # we begin iteration at the beginning of the list
+    start = 0
+    # the iterables are the whole list
+    it_list = eligible_nodes[start:]
+
+    while it_list:
+        this = eligible_nodes[start] # object to compare
+        those = eligible_nodes[start+1:] # objects to be compared to
+        start+=1 # iterables
+        it_list = eligible_nodes[start:] # iterables
+
+        # only the eligible ones to compare (if an entity got mapped during an earlier iterated entity, we don't want to map to it)
+        search = [o for o in those if o.eligible]
+        matches = []
+
+        if search and this.eligible:
+            # function not equipped to handle single token entities
+            if this.token_length==1:
+                continue
+
+            # create the "vacuumed" name
+            # Christian John Rozolis becomes Christian Rozolis
+            this_vacuumed = [this.tokens_wo_suff[0], this.tokens_wo_suff[-1]]
+
+            for that in search:
+                # don't handle single token entities, make sure this entity is still eligible
+                if not this.eligible or that.token_length==1:
+                    continue
+
+                # for the other entity to compare, build the vacuumed name
+                that_vacuumed = [that.tokens_wo_suff[0], that.tokens_wo_suff[-1]]
+
+                # if the vacuumed names are similar
+                if fuzz.ratio(this_vacuumed[0], that_vacuumed[0])>=85 and fuzz.ratio(this_vacuumed[1], that_vacuumed[1])>=85:
+                    # if the names are both long
+                    if this.token_length>=3 and that.token_length>=3:
+                        # and the second tokens first letters dont match, VETO
+                        # Christian Smith Vanhausen vs. Christian Mith Vanheurson
+                        if this.tokens_wo_suff[1][0]!= that.tokens_wo_suff[1][0]:
+                            continue
+                        # or there is a suffix mismatch, VETO
+                        if this.suffix and that.suffix and this.suffix!= that.suffix:
+                            continue
+                    # otherwise, consider as possible match
+                    matches.append(that)
+
+        # if possible matches were found                    
+        if matches:
+            this.assess_ambiguity(matches,  'Vacuum Search', 'Free [4]')
+            ## BLOCK BELOW IS DEV TESTING BLOCK
+            # if not this.assess_ambiguity(matches,  'Vacuum Search', 'Free [4]'):
+            #     print('failure')
+            #     print((this.name, this.courts, this.eligible, this.NID, this.BA_MAG_ID, this.serial_id, this.POINTS_TO_SID))
+            #     for m in matches:
+            #         print("--",(m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
+
+    return nodes
+
+def PIPE_Free_Token_Sort_Pool_Based(nodes: list):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match by token sort fuzzy standards
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
+
+    Args:
+        nodes (list): list of FreeMatch custom objects from JED_Classes
+
+    Returns:
+        list: list of the same objects that entered the function, with their parent/child connections updated
+    """
+    # we will only consider the nodes that remain eligible to be mapped to each other
+    eligible_nodes = [N for N in nodes if N.eligible]
+    
+    # we begin iteration at the beginning of the list
+    start = 0
+    # the iterables are the whole list
+    it_list = eligible_nodes[start:]
+    while it_list:
+        this = eligible_nodes[start] # object to be compared
+        those = eligible_nodes[start+1:] # other objects to compare to
+        start+=1 # iterables
+        it_list = eligible_nodes[start:] # iterables
+
+        # only the eligible ones to compare (if an entity got mapped during an earlier iterated entity, we don't want to map to it)
+        search = [o for o in those if o.eligible]
+        matches = []
+
+        # if a search space remains, and this entity is eligible
+        if search and this.eligible:
+            # function not equipped to handle single-token entities, and we err on the side of caution and only consider
+            # entities with 3 or more tokens
+            if this.token_length<=2:
+                continue
+            # for every other entity, check it
+            for that in search:
+                # will only compare to eligible 3+ token entities
+                # confirm in a prior loop that this entity was not mapped elsewhere, and that it remains eligible
+                if not this.eligible or that.token_length<=2:
+                    continue
+
+                # fuzzy matching bound
+                bound = 98
+
+                # if their token sort ratios are strong matches, hooray
+                if fuzz.token_sort_ratio(this.base_tokens, that.base_tokens) >=bound:
+
+                    if this.tokens_wo_suff[0] == that.tokens_wo_suff[-1]+"s" or \
+                        that.tokens_wo_suff[0] == this.tokens_wo_suff[-1]+"s":
+                        # mark a roberts is not robert a marks (rolls eyes)
+                        # john roberts, robert johns, etc.
+                        # I cannot believe this problem exists
+                        continue
+                    # if they are both equally long, had a high match rate, had single character middle initials
+                    # but their middle initials don't match, be cautious and dont match
+                    # James M Smith != James T Smith
+                    if this.token_length ==3 and that.token_length == 3:
+                        if len(this.base_tokens[1])==1 and len(that.base_tokens[1])==1:
+                            if this.base_tokens[1] != that.base_tokens[1]:
+                                continue
+
+                    # if the match was successful and not excluded via continuation above, consider it
+                    matches.append(that)
+
+        # if possible matches were found        
+        if matches:
+            this.assess_ambiguity(matches,  'Token Sorts', 'Free [5]')
+            ## BLOCK BELOW IS DEV TESTING BLOCK
+            # if not this.assess_ambiguity(matches,  'Token Sorts', 'Free [5]'):
+            #     print('failure')
+            #     print((this.name, this.courts, this.eligible, this.NID, this.BA_MAG_ID, this.serial_id, this.POINTS_TO_SID))
+            #     for m in matches:
+            #         print("--",(m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
+                    
+    return nodes
+
+def PIPE_Free_Van_Sweeps_Pool_Based(nodes: list):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match by the Germanic "Van" pattern standards
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
+
+    Args:
+        nodes (list): list of FreeMatch custom objects from JED_Classes
+
+    Returns:
+        list: list of the same objects that entered the function, with their parent/child connections updated
+    """
+
+    # build the list of known entities that qualify as "Van" based names
     vans = []
-    for each in [o for o in NODES if re.search(r'^van | van',o.name) and o.eligible]:
+    # the entity may begin with the token van, or van as part of a longer name if the written form
+    # did not maintain spacing
+    # i.e. Van Kloet could have been written Vankloet. This pattern grabs both
+    for each in [o for o in nodes if re.search(r'^van | van',o.name) and o.eligible]:
         # if the first token is not van we will attempt disambiguation for it in the van search
-        # not too sure why I did this??
-        if "van"!= each.name.split()[0]:
-            vans.append(each)
+        # not too sure why I did this?? -- this function is meant for full names with Van in them
+        # -- not for surname representations starting with van
+        # i.e. YES to Gregory F Van Tatenhoven NO to Van Gundy
+        # if "van"!= each.name.split()[0]:
+        vans.append(each)
 
     new_vans = []
     old_vans = []
@@ -299,543 +508,54 @@ def PIPE_Free_Van_Sweep(NODES):
 
     # now, using our newly constructed van names, see if they match up to the old ones
     # basically this leveled the field and compared them all as fuzed names VanHeusen, VanWeld, etc.
-    for obj, newname in new_vans:
-        if obj.suffix:
+    for this, newname in new_vans:
+        if this.suffix:
             anchor = newname.split()[-2]
         else:
             anchor = newname.split()[-1]
 
+        matches = []
         for old in old_vans:
             old_anchor = old.anchor
-
+            # now comparing fuzed VAN names as the anchors
             if fuzz.ratio(anchor, old_anchor)>=90:
-                obj.choose_winner(old, "Van Sweep")
-    return NODES
+                matches.append(old)
+        
+        if matches:
+            this.assess_ambiguity(matches,  'Van Names', 'Free [6]')
+            ## BLOCK BELOW IS DEV TESTING BLOCK
+            # if not this.assess_ambiguity(matches,  'Van Names', 'Free [6]'):
+            #     print('failure')
+            #     print((this.name, this.courts, this.eligible, this.NID, this.BA_MAG_ID, this.serial_id, this.POINTS_TO_SID))
+            #     for m in matches:
+            #         print("--",(m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
 
+    return nodes
 
-#######################################
-## Anchor and Single Token Functions ##
-#######################################
-
-def PIPE_Anchor_Reduction_UCID(entity_map):
-    """Specialty disambiguation function that uses exceptions + anchors to map some entities to each other
-    primarily by surname. The exceptions contain a few common typos that I solve for as well
-
-    Args:
-        entity_map (dict): key = ucid, values = list of nodes in a ucid we are trying to reduce
-
-    Returns:
-        dict: the same dict that entered, but the child objects in the lists may be updated and disambiguated
-    """
-    print("\nPipe: Anchor Reduction within UCIDs")
-
-    # exception entities that caused some trouble in identifying their anchors (surnames)
-    exceptions = {
-        'otazo reyess':'alicia m otazo reyes',
-        'der yeghiyan': 'samuel der yeghiayan',
-        'der yeghiayans': 'samuel der yeghiayan',
-        'der yerghiayan': 'samuel der yeghiayan',
-        'emy st eve':'amy j st eve',
-        'st eves': 'amy j st eve',
-        'ann nolan': 'nan r nolan',
-        'mc giverin': 'bruce j mcgiverin',
-        'chip campbell': 'william l campbell jr'
-    }
-
-    for key, objs in tqdm.tqdm(entity_map.items()):
-        # key = ucid
-        # objs = entities on the docket
-        start = 0
-        # start with all entities
-        it_list = objs[start:]
-        # while we are still comparing all entities
-        while it_list:
-            # pick current judge
-            this = objs[start]
-            # pick all other judges to compare to from the case, that havent been compared to it yet
-            those = objs[start+1:]
-            
-            # iterate our counters up, and the next list to iterate after we complete here.
-            # the while loop exists when we go beyond the index length of the list
-            start+=1
-            it_list = objs[start:]
-
-            # judges we will try to compare to
-            search = [o for o in those if o.eligible]
-            # if this judge is eligible to be mapped
-            if search and this.eligible:
-                for that in search: # for other judges on the case
-                    # if either judge does not have an anchor, move on (if the entity surname was somehow not identifiable)
-                    if not this.anchor or not that.anchor:
-                        continue
-
-                    # single letters are bad for this exercise, if the final anchor token was a single letter, move on
-                    if len(this.anchor)==1 or len(that.anchor)==1:
-                        continue
-
-                    # checkwork begins, if the surname anchors are similar, or partially similar
-                    if fuzz.ratio(this.anchor, that.anchor)>=92 or fuzz.partial_ratio(this.anchor, that.anchor)>=92:
-                        # if we're doing a special check on single token names, make sure we're not getting coles in colemans
-                        # TODO: there will be more names like this to account for
-                        if len(this.tokens_wo_suff)==1 or len(that.tokens_wo_suff)==1:
-                            if (this.anchor in ['cole','coles'] and that.anchor in ['coleman','colemans']) or (
-                                that.anchor in ['cole','coles'] and this.anchor in ['coleman','colemans']):
-                                # bad match
-                                continue
-                            # presumably good
-                            #otherwise they match
-                            this.choose_winner_ucids(that, f'Anchors-ucid-I', key)
-                            continue
-
-                        # o for o connor
-                        # basically if they matched in fuzzy, and one name was "o connor" see if the other name is oconnor
-                        # same deal with J Mathison and Mathison where the J stands for Judge 
-                        if len(this.base_tokens)==2 and this.base_tokens[0] in ['jude','j','o']:
-                            # attempt the remainder of the name after the botched prefix
-                            thisname = " ".join(this.base_tokens[1:])
-                            if fuzz.partial_ratio(thisname, that.name)>=92:
-                                this.choose_winner_ucids(that, f'Anchors-ucid-I', key)
-                                continue
-                        # flip logic on the other judge
-                        if len(that.base_tokens)==2 and that.base_tokens[0] in ['jude','j','o']:
-                            thatname = " ".join(that.base_tokens[1:])
-                            if fuzz.partial_ratio(this.name, thatname)>=92:
-                                this.choose_winner_ucids(that, f'Anchors-ucid-I', key)
-                                continue
-
-                        # if there is a mismatch in the first tokens confirm that it's not a partial name
-                        # i.e. Amy j st eve mismatches st ever
-                        if len(this.base_tokens[0])>1 and \
-                            len(that.base_tokens[0])>1 and \
-                            this.base_tokens[0]!=that.base_tokens[0]:
-
-                            if fuzz.partial_ratio(this.name, that.name)<98:
-                                compy = this.name
-                                campy = that.name
-                                if this.name in exceptions:
-                                    compy = exceptions[this.name]
-                                if that.name in exceptions:
-                                    campy = exceptions[that.name]
-                                if fuzz.partial_ratio(compy, campy)>=98:
-                                    # presumably good
-                                    this.choose_winner_ucids(that, f'Anchors-ucid-I', key)
-                                    continue
-                            else:
-                                # presumably good (their similarity was above 98%)                                
-                                this.choose_winner_ucids(that, f'Anchors-ucid-I', key)
-                                continue
-    
-    return entity_map
-
-def PIPE_Anchor_Reduction_II_UCID(entity_map):
-    """Specialty disambiguation function that uses exceptions + anchors to map some entities to each other
-    primarily by surname. This is a secondary implementation of disambiguation, stacked on top of the first layer
-    of anchor disambiguation
+def PIPE_Free_Initialisms_Pool_Based(nodes: list):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match by abstract initials standards
+    i.e. Irene Patricia Murphy Kelly was frequently written as Irene M K
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
 
     Args:
-        entity_map (dict): key = ucid, values = list of nodes in a ucid we are trying to reduce
+        nodes (list): list of FreeMatch custom objects from JED_Classes
 
     Returns:
-        dict: the same dict that entered, but the child objects in the lists may be updated and disambiguated
+        list: list of the same objects that entered the function, with their parent/child connections updated
     """
-    print("\nPipe: Anchor Reduction II within UCIDs")
-
-    for key, objs in tqdm.tqdm(entity_map.items()):
-        # key = ucid
-        # objs = entities on the docket
-        start = 0
-        # start with all entities
-        it_list = objs[start:]
-        # while we are still comparing all entities
-        while it_list:
-            this = objs[start] # current judge
-            those = objs[start+1:] # other judges to compare to
-
-            start+=1 # update iterables
-            it_list = objs[start:] # update iterables
-
-            # eligible search for disambiguation
-            search = [o for o in those if o.eligible]
-            if search and this.eligible:
-                for that in search: # for other judges on the ucid
-                    # if the surnames match at 90% or more
-                    if fuzz.ratio(this.anchor, that.anchor)>=90:
-                        # anchors >90% and tokens all above 98%
-                        if fuzz.token_set_ratio(this.base_tokens, that.base_tokens) >=98:
-                            this.choose_winner_ucids(that,f"Anchors-ucid-II", key)
-                            continue
-                        # one of the entities was just a surname
-                        if this.token_length==1 and that.token_length>1 or this.token_length>1 and that.token_length==1:
-                            this.choose_winner_ucids(that,f"Anchors-ucid-II", key)
-                            continue
-                    # if one is a surname and the other is 2 tokens
-                    if len(this.base_tokens[0])==1 and this.token_length==2:
-                        # try fuzing the 2-token name into one and see if there was a misc. letter
-                        this_alt_anchor = "".join(this.base_tokens)
-                        if fuzz.ratio(this_alt_anchor, that.anchor)>=95:
-                            this.choose_winner_ucids(that,f"Anchors-ucid-II", key)                            
-                            continue
-                    # if both multitoken
-                    if this.token_length>=2 and that.token_length>=2:
-                        # if they are long names and the last tokens first letter doesnt match, fail out
-                        if this.token_length>=3 and that.token_length>=3:
-                             if this.tokens_wo_suff[1][0] != that.tokens_wo_suff[1][0]:
-                                continue
-                        # try comparing the first and last tokens individually in the names
-                        if fuzz.ratio(this.tokens_wo_suff[0],that.tokens_wo_suff[0])>=90 and \
-                            fuzz.ratio(this.tokens_wo_suff[-1],that.tokens_wo_suff[-1])>=90:
-                            this.choose_winner_ucids(that,f"Anchors-ucid-II", key)                            
-                            continue
-                    # compare if the longer entity had dual last names and the short entity matched one of them
-                    # basically: this = Smith Washington | that = Smith Washington Jones
-                    if this.token_length==2 and that.token_length>2:
-                        if fuzz.ratio(this.tokens_wo_suff[0],that.tokens_wo_suff[-2])>=90 and \
-                            fuzz.ratio(this.tokens_wo_suff[1],that.tokens_wo_suff[-1])>=90:
-                            this.choose_winner_ucids(that,f"Anchors-ucid-II", key)
-                            continue
-    return entity_map
-
-def PIPE_Anchor_Reduction_III_UCID(entity_map):
-    """Specialty disambiguation function that uses exceptions + anchors to map some entities to each other
-    primarily by surname. This is a third implementation of disambiguation, stacked on top of the first and
-    second layer of anchor disambiguation
-
-    Args:
-        entity_map (dict): key = ucid, values = list of nodes in a ucid we are trying to reduce
-
-    Returns:
-        dict: the same dict that entered, but the child objects in the lists may be updated and disambiguated
-    """
-    for key, objs in tqdm.tqdm(entity_map.items()):
-        start = 0
-        it_list = objs[start:]
-        while it_list:
-            this = objs[start] # object for comparison
-            those = objs[start+1:] # list of other objects for comparison
-
-            start+=1 # update iterables
-            it_list = objs[start:] # update iterables
-
-            # eligible to be matched
-            search = [o for o in those if o.eligible]
-            if search and this.eligible:
-                for that in search: # for all other judge names on the ucid we are comparing to
-                    # running only for longer names
-                    if this.token_length>=2:
-                        # against longer names
-                        if that.token_length>=2:
-                            # if the suffixless names match and the anchors (surnames match)
-                            if fuzz.ratio(this.tokens_wo_suff[0], that.tokens_wo_suff[0])>=90 and fuzz.ratio(this.tokens_wo_suff[-1], that.tokens_wo_suff[-1])>=90:
-                                # GOOD MATCH
-                                this.choose_winner_ucids(that, f"Anchors-ucid-III", key)                                
-                                continue
-                            # if a mashed string form matches strongly, then it's probably misspelling or misc. letters junking up the match and its good
-                            if fuzz.ratio("".join(this.base_tokens), "".join(that.base_tokens))>=95:
-                                this.choose_winner_ucids(that, f"Anchors-ucid-III", key)                                
-                                continue
-                        
-                        # if the first token is a letter and it's "j" assume it stands for judge, or jude stands for judge
-                        if (len(this.base_tokens[0])==1 and this.base_tokens[0]=='j') or this.base_tokens[0]=='jude':
-                            # assume this entity is a single surname then and attempt matching without the j or jude
-                            this_alt_anchor = this.base_tokens[1]
-                            if fuzz.ratio(this_alt_anchor, that.anchor)>=92:
-                                this.choose_winner_ucids(that, f"Anchors-ucid-III", key)                                
-                                continue
-                        
-                        # mashed string forms of the entity names
-                        thisjoin = ".".join(this.base_tokens)
-                        thatjoin = ".".join(that.base_tokens)
-                        # if the smashed forms have a decent match
-                        if thisjoin in thatjoin or thatjoin in thisjoin or fuzz.ratio(thisjoin, thatjoin)>=92:
-                            # they need to be longer than 3 letters (initials not considered here like CJR)
-                            if len("".join(this.base_tokens))<=3 or len("".join(that.base_tokens))<=3:
-                                # bad match
-                                continue
-                            # single token names from headers are usually just initials and cannot confidently be handled here
-                            if (this.token_length ==1 and this.was_header) or (that.token_length ==1 and that.was_header):
-                                #bad match
-                                continue
-                            
-                            # if we didnt fail out, then the mashed names worked and we say they match
-                            this.choose_winner_ucids(that, f"Anchors-ucid-III", key)
-                            
-    
-    return entity_map
-
-def PIPE_Anchor_Reduction_Court(court_map_long, court_map_single):
-    """Special function to work anchor matching (matching by surname only) into the court level disambiguation
-
-    Args:
-        court_map_long (dict): key = court, value = list of entity objects whose names are multi-tokened
-        court_map_single (dict): key = court, value = list of entity objects whose names are single-tokened
-
-    Returns:
-        dict: key = court, value = list of entity objects reduced in the court
-    """
-    print("\nPipe: Court Anchor Reduction")
-
-    # wonk spelling errors to try and solve for
-    # if 2 entities match, but any are in this exceptions list, bypass them. We cannot be confident oliver is misspelled toliver, they could be distinct
-    exceptions = {
-        'case':'casey',
-        'ann':'mann',
-        'leven':'leen',
-        'stevens':'stevenson',
-        'toliver':'oliver'
-    }
-
-    # for each court
-    for court, long_objs in court_map_long.items():
-        # grab the uni-token entities as well corresponding to this court
-        single_objs = court_map_single[court]
-
-        # only check what is eligible at this point
-        longs = [o for o in long_objs if o.eligible]
-        singles = [o for o in single_objs if o.eligible]
-
-        # for every uni-token entity
-        for each in singles:
-            # init matching nothing
-            matches = []
-            # compare to every long name
-            for l in longs:
-                # if the surnames (anchors) match confidently, add it to a running list of matches
-                if fuzz.ratio(each.anchor, l.anchor)>=85:
-                    matches.append(l)
-            # if only one multi-token name matches this single token name
-            if len(matches) == 1:
-                # as long as it is not an exception
-                if each.name in exceptions and exceptions[each.name] == matches[0]:
-                    continue
-                # reduce the small one onto the long one
-                each.choose_winner_ucids(matches[0], f"Court-Anchors", court)
-            
-            # else if multiple multi-token entities match a single-token surname
-            elif len(matches)>1:
-                # determine if any of them are actual exact matches by surname
-                exact_ms = [m for m in matches if each.anchor == m.anchor]
-                # if only one is an exact match
-                if len(exact_ms)==1:
-                    # and it is not an exception
-                    if each.name in exceptions and exceptions[each.name] == exact_ms[0]:
-                        continue
-                    
-                    # reduce it
-                    each.choose_winner_ucids(exact_ms[0], f"Court-Anchors", court)
-    
-    # group the 2 dicts into one now
-    final_map = {}
-    for court, objects in court_map_long.items():
-        final_map[court] = objects + court_map_single[court]
-
-    return final_map
-
-##############################
-## Fuzzy Matching Functions ##
-##############################
-
-#--------------#
-# Unrestricted #
-#--------------#
-def PIPE_Free_Fuzzy(NODES):
-    """Given a list of nodes, during free-matching disambiguation see if any fuzzy match to each other
-
-    Args:
-        NODES (list): list of objects to be free matched using fuzzy matching
-
-    Returns:
-        list: list of same objects that entered the function, but with some now disambiguated to each other
-    """
-    print("\nPipe: Free Matching Large Scale Fuzzy")
-    # start with only those remaining eligible to be mapped
-    objs = [N for N in NODES if N.eligible]
-    
-    start = 0 # iterables
-    it_list = objs[start:] # iterables
-    while it_list:
-        this = objs[start] # entity to compare
-        those = objs[start+1:] # other entities to test
-        start+=1 # iterables
-        it_list = objs[start:] # iterables
-
-        # only the eligible ones to compare (if an entity got mapped during an earlier iterated entity, we don't want to map to it)
-        search = [o for o in those if o.eligible]
-        if search and this.eligible:
-            # this function does not handle single token entities
-            if this.token_length==1:
-                continue
-            for that in search:
-                # if at some point in this loop at actually became ineligible, then move on
-                # if the possible match is a single token, move on
-                if not this.eligible or that.token_length==1:
-                    continue
-                # fuzzy match bound
-                bound = 93
-                # the full entity name needs to fuzzy match above this bound
-                if fuzz.ratio(this.name, that.name) >=bound:
-                    this.choose_winner(that, "FreeFuzzy")
-    return NODES
-
-#------------#
-# UCID/COURT #
-#------------#
-
-def PIPE_Fuzzy_Matching(entity_map):
-    """fuzzy matching to be used for intra-ucid or intra-court disambiguation
-
-    Args:
-        entity_map (dict): key = ucid or court, values = lists of objects per ucid or court that will be reduced onto each other
-
-    Returns:
-        dict: same dict that entered the function, but the child objects will be updated in some cases after reduction
-    """
-    print("\nPipe: Fuzzy Matching")
-    # for each ucid/court and the corresponding entity objects
-    for key, objs in tqdm.tqdm(entity_map.items()):
-        start = 0 # iterables
-        it_list = objs[start:] # iterables
-        # comparison is bidirectional such that A compared to B is equivalent to B compared to A
-        # when we enumerate out the list of comparisons it is effectively like: [A, B, C, D]
-        # --> AB, AC, AD, BC, BD, CD
-        while it_list: # go until we reach the end of the list
-            this = objs[start] # entity to compare
-            those = objs[start+1:] # other entities we compare to
-            start+=1 # iterables
-            it_list = objs[start:] # the next loop
-
-            # only want eligible entities. Eligible means another entity can point to it and be disambiguated to it and this entity does not point elsewhere
-            search = [o for o in those if o.eligible]
-            if search: # if there are eligible ones
-                for that in search:
-                    # if each entity appeared on more than 20 ucids OR
-                    # one of the entities appeared much more frequently than the other
-                    # loosen the bound a bit, more common occurrences == more leeway for typos
-                    if (this.n_ucids/that.n_ucids)>20 or (that.n_ucids/this.n_ucids)>20:
-                        bound = 90
-                    else:
-                        bound = 93
-
-                    # if they fuzzy matched, hooray
-                    if fuzz.ratio(this.name, that.name) >=bound:
-                        # object routine to reduce the objects with each other
-                        this.choose_winner_ucids(that, "UCIDFuzzy", key)
-
-    return entity_map
-
-#######################
-## Simple Token Sort ##
-#######################
-
-def PIPE_Free_Token_Sort(NODES):
-    """Pipe used in Free-matching disambiguation to compare 2 entities tokens in a token-sort fuzzy match
-
-    Args:
-        NODES (list): list of objects being reduced in disambiguation
-
-    Returns:
-        list: same list that entered the function, but now some objects will point to each other
-    """
-    print("\nPipe: Free Matching; Token Sort Matching")
-
-    # only eligible ones desired
-    objs = [N for N in NODES if N.eligible]
-
-    start = 0 # iterables
-    it_list = objs[start:] # iterables
-    while it_list:
-        this = objs[start] # object to be compared
-        those = objs[start+1:] # other objects to compare to
-        start+=1 # iterables
-        it_list = objs[start:] # iterables
-
-        # again only eligible ones
-        search = [o for o in those if o.eligible]
-        if search and this.eligible:
-            # function not equipped to handle single-token entities
-            if this.token_length==1:
-                continue
-            # for every other entity, check it
-            for that in search:
-                if not this.eligible or that.token_length==1:
-                    continue
-                
-                # fuzzy matching bound
-                bound = 93
-
-                # if their token sort ratios are strong matches, hooray
-                if fuzz.token_sort_ratio(this.base_tokens, that.base_tokens) >=bound:
-                    this.choose_winner(that, "Free Token Sort")
-    return NODES
-
-#########################################
-## Initial and Middle Vacuum Functions ##
-#########################################
-def PIPE_Free_Vacuum(NODES):
-    """Pipe to be used in free-matching disambiguation. This "vacuums out" middle names and just compares first and last names.
-    Example: Christian John Rozolis and Chris J. Rozolis are compared as Christian Rozolis vs. Chris Rozolis
-
-    Args:
-        NODES (list): list of objects to be reduced in free matching
-
-    Returns:
-        list: same list that entered the function, but now a few of the objects point to each other
-    """
-    print("\nPipe: Free Matching; Vacuum middle initials")
-    # only want eligible ones
-    objs = [N for N in NODES if N.eligible]
-
-    start = 0 # iterables
-    it_list = objs[start:] # iterables
-    while it_list:
-        this = objs[start] # object to compare
-        those = objs[start+1:] # objects to be compared to
-        start+=1 # iterables
-        it_list = objs[start:] # iterables
-
-        search = [o for o in those if o.eligible]
-        if search and this.eligible:
-            # function not equipped to handle single token entities
-            if this.token_length==1:
-                continue
-            
-            # create the "vacuumed" name
-            this_vacuumed = [this.tokens_wo_suff[0], this.tokens_wo_suff[-1]]
-            for that in search:
-                if not this.eligible or that.token_length==1:
-                    continue
-                # for every other entity, build the vacuumed name
-                that_vacuumed = [that.tokens_wo_suff[0], that.tokens_wo_suff[-1]]
-                # if the token comparison ratio of the vacuumed names is trong
-                if fuzz.ratio(this_vacuumed[0], that_vacuumed[0])>=90 and fuzz.ratio(this_vacuumed[1], that_vacuumed[1])>=90:
-                    # if the names are both long
-                    if this.token_length>=3 and that.token_length>=3:
-                        # and the last names first letters dont match, VETO
-                        if this.tokens_wo_suff[1][0]!= that.tokens_wo_suff[1][0]:
-                            continue
-                        # or there is a suffix mismatch, VETO
-                        if this.suffix and that.suffix and this.suffix!= that.suffix:
-                            continue
-                    # otherwise, hooray
-                    this.choose_winner(that, "FreeVacuum")
-    return NODES
-
-def PIPE_Free_Initialisms(NODES):
-    """Pipe to be used in Free-matching disambiguation. This pipe works on names that frequently occur as initialisms and
-    dont have a strong match to their formal names
-    example: P K Holmes needs to eventually find its way to Patrick Kinloch Holmes III
-
-    Args:
-        NODES (list): list of objects to be reduced in free matching
-
-    Returns:
-        list: same list that entered the function, but now a few of the objects point to each other
-    """
-    print("\nPipe: Free Matching; Initialisms")
-    # empty list of possible nodes to match
+    # develop a list of nodes that qualify to be considered in this style of matching
     matchy = []
     # check only those eligible
-    for each in [o for o in NODES if o.eligible]:
-        # if the name is 3 tokens long, doesnt have a suffix, the surname is one letter, the first name is multiple, and the middle initial is one letter
+    for each in [o for o in nodes if o.eligible]:
+        # if the name is:
+        #    3 tokens long,
+        #    doesnt have a suffix,
+        #    the surname is one letter,
+        #    the first name is multiple characters,
+        #    and the middle initial is one letter
+        # i.e. Irene Patricia Murphy Kelly was frequently written as Irene M K
         # then consider it for matching
         if each.token_length == 3 and\
             not each.suffix and \
@@ -843,52 +563,425 @@ def PIPE_Free_Initialisms(NODES):
             len(each.base_tokens[0])>2 and \
             len(each.base_tokens[1])==1:
             matchy.append(each)
+
     # for all eligible to be matched
     for m in matchy:
+        if not m.eligible:
+            continue
         # compare against all long names
-        for n in [o for o in NODES if o.eligible and o!=m and o.token_length>=3]:
+        matches = []
+
+        for n in [o for o in nodes if o.eligible and o!=m and o.token_length>=3]:
             # if the first letters match across the board and the first names match
             if n.base_tokens[0] == m.base_tokens[0] and \
                 n.base_tokens[1][0] == m.base_tokens[1][0] and\
                 n.base_tokens[2][0] == m.base_tokens[2][0]:
-                m.choose_winner(n, "Initialisms")
+                matches.append(n)
+    
             # if the first names match and the offset tokens from a longer name match
             # i.e. Chris John Rozolis Stevens and Chris Rozolis Stevens
             if len(n.base_tokens)>3 and n.base_tokens[0] == m.base_tokens[0] and \
                 n.base_tokens[2][0] == m.base_tokens[1][0] and\
                 n.base_tokens[3][0] == m.base_tokens[2][0]:
-                m.choose_winner(n, "Initialisms")
-    return NODES
+                matches.append(n)
 
-def PIPE_Free_Single_Letters(NODES):
-    """Free matching pipe function for any entities whose first token is a single letter
+        # if we had names qualify as possible matches, assess ambiguity
+        if matches:
+            m.assess_ambiguity(matches,  'initialisms', 'Free [7]')
+            ## BLOCK BELOW IS DEV TESTING BLOCK
+            # if not m.assess_ambiguity(matches,  'initialisms', 'Free [7]'):
+            #     print('failure')
+            #     print((m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
+            #     for oth in matches:
+            #         print("--",(oth.name, oth.courts, oth.eligible, oth.NID, oth.BA_MAG_ID, oth.serial_id, oth.POINTS_TO_SID))
+    
+    return nodes
+
+def PIPE_Free_Single_Letter_Names_Pool_Based(nodes: list):
+    """Given a group of IntraMatch/FreeMatch objects, reduce them if their names match by single letter name standards
+    i.e. a wallace tashima and atsushi wallace tashima are the same entity
+    This function handles ambiguous entities: if there are multiple ground truth names across districts, reduction
+    does not happen. (i.e. Patricia Sullivan in ORD is different from Patricia Sullivan in RID, an appearance of 
+    Patricia Sullivan in ILND cannot be reduced to one or the other and remains ambiguous)
 
     Args:
-        NODES (list): list of objects to be reduced in free matching
+        nodes (list): list of FreeMatch custom objects from JED_Classes
 
     Returns:
-        list: same list that entered the function, but now a few of the objects point to each other
+        list: list of the same objects that entered the function, with their parent/child connections updated
     """
-    print("\nPipe: Free Match; Single Letter Starters")
 
-    # if the entity is multi-tokened
-    for each in [o for o in NODES if o.eligible and o.token_length>=2]:
-        # and the first token is a single letter
-        if len(each.base_tokens[0])==1:
+    # only going to compare to long names and eligible names
+    for this in [o for o in nodes if o.eligible and o.token_length>=2]:
+        if not this.eligible:
+            continue
+
+        # specifically care if the first token is a single letter
+        if len(this.base_tokens[0])==1:
+
             # compare against all other multi-tokened names
-            for check in [o for o in NODES if o.eligible and o!=each and o.token_length>=2]:
+            matches = []
+            for check in [o for o in nodes if o.eligible and o!=this and o.token_length>=2]:
                 # if they have a decent token sort ratio AND the second token is an exact match, then they're good
-                # i.e. J A Adande and A Adandu
-                if fuzz.token_sort_ratio(each.name,check.name)>80 and each.base_tokens[1]==check.base_tokens[1]:
-                    each.choose_winner(check, "Single Letters")
+                # i.e. a wallace tashima and atsushi wallace tashima
+                if fuzz.token_sort_ratio(this.name,check.name)>80 and this.base_tokens[1]==check.base_tokens[1]:
+                    matches.append(check)
+                # if their dual abbreviation forms are a strong match
+                # paul kinlock holmes iii and pk holmes iii match here
+                elif fuzz.ratio(this.init_init_sur_suff, check.init_init_sur_suff)>=92 and this.anchor==check.anchor:
+                    # if the second token in the words are both not abbreviated and dont equal each other, void the match
+                    if len(this.base_tokens[1])>1 and len(check.base_tokens[1])>1 and this.base_tokens[1] != check.base_tokens[1]:
+                        continue
+                    matches.append(check)
+            
+            # assess the matches for ambiguities
+            if matches:
+                this.assess_ambiguity(matches,  'Single Letters', 'Free [8]')
+                ## BLOCK BELOW IS DEV TESTING BLOCK
+                # if not this.assess_ambiguity(matches,  'Single Letters', 'Free [8]'):
+                #     print('failure')
+                #     print((this.name, this.courts, this.eligible, this.NID, this.BA_MAG_ID, this.serial_id, this.POINTS_TO_SID))
+                #     for m in matches:
+                #         print("--",(m.name, m.courts, m.eligible, m.NID, m.BA_MAG_ID, m.serial_id, m.POINTS_TO_SID))
+    
+    return nodes
+    
 
-    return NODES
+#######################################
+## Anchor and Single Token Functions ##
+#######################################
+
+def PIPE_Anchor_Reduction_UCID(entity_list: list, pipeline_locale: str):
+    """Specialty disambiguation function that uses exceptions + anchors to map some entities to each other
+    primarily by surname. The exceptions contain a few common typos that I solve for as well
+
+    Args:
+        entity_map (list): list of nodes in a ucid we are trying to reduce
+        pipeline_locale (str): where in the disambiguation pipeline this is being called (for logging)
+
+    Returns:
+        list: the same list that entered, but the child objects in the lists may be updated and disambiguated
+    """
+    # print("\nPipe: Anchor Reduction within UCIDs")
+
+    eligible_list = [o for o in entity_list if o.eligible]
+
+    # objs = entities on the docket
+    start = 0
+    # start with all entities
+    it_list = eligible_list[start:]
+    # while we are still comparing all entities
+    while it_list:
+        # pick current judge
+        this = eligible_list[start]
+        # pick all other judges to compare to from the case, that havent been compared to it yet
+        those = eligible_list[start+1:]
+        
+        # iterate our counters up, and the next list to iterate after we complete here.
+        # the while loop exists when we go beyond the index length of the list
+        start+=1
+        it_list = eligible_list[start:]
+
+        # judges we will try to compare to
+        search = [o for o in those if o.eligible]
+        # if this judge is eligible to be mapped
+        if search and this.eligible:
+            for that in search: # for other judges on the case
+                # if either judge does not have an anchor, move on (if the entity surname was somehow not identifiable)
+                if not this.anchor or not that.anchor:
+                    continue
+
+                # single letters are bad for this exercise, if the final anchor token was a single letter, move on
+                if len(this.anchor)==1 or len(that.anchor)==1:
+                    continue
+
+                # checkwork begins, if the surname anchors are similar, or partially similar
+                if fuzz.ratio(this.anchor, that.anchor)>=92 or fuzz.partial_ratio(this.anchor, that.anchor)>=92:
+                    # if we're doing a special check on single token names, make sure we're not getting coles in colemans
+                    # TODO: there will be more names like this to account for
+                    if len(this.tokens_wo_suff)==1 or len(that.tokens_wo_suff)==1:
+                        # if it is just surnames, ensure they are close enough in size that this is a typo
+                        # i.e. do not capture Cole in Coleman or Roberts in Robertson
+                        diff = len(this.anchor)-len(that.anchor)
+                        if diff >2 or diff <-2:
+                            continue
+                        # presumably good
+                        #otherwise they match
+                        this.choose_winner(that, f'Anchors-ucid-I [CB1]', pipeline_locale)
+                        continue
+
+                    # o for o connor
+                    # basically if they matched in fuzzy, and one name was "o connor" see if the other name is oconnor
+                    # same deal with J Mathison and Mathison where the J stands for Judge 
+                    # Mc Donald, Van Geulen
+                    possibilities=['jude','j','o', 'mc','van']
+                    if len(this.base_tokens)==2 and this.base_tokens[0] in possibilities:
+                        # attempt the remainder of the name after the botched prefix
+                        thisname = " ".join(this.base_tokens[1:])
+                        if fuzz.partial_ratio(thisname, that.name)>=92:
+                            this.choose_winner(that, f'Anchors-ucid-I [CB2]', pipeline_locale)
+                            continue
+                    # flip logic on the other judge
+                    if len(that.base_tokens)==2 and that.base_tokens[0] in possibilities:
+                        thatname = " ".join(that.base_tokens[1:])
+                        if fuzz.partial_ratio(this.name, thatname)>=92:
+                            this.choose_winner(that, f'Anchors-ucid-I [CB3]', pipeline_locale)
+                            continue
+
+                    # if there is a mismatch in the first tokens confirm that it's not a partial name
+                    # i.e. Amy j st eve matches st eves
+                    if this.token_length >=2 and that.token_length >=2 and \
+                        len(this.base_tokens[0])>1 and \
+                        len(that.base_tokens[0])>1 and \
+                        this.base_tokens[0]!=that.base_tokens[0]:
+
+                        if fuzz.partial_ratio(this.name, that.name)>=98:
+                            # presumably good (their similarity was above 98%)                                
+                            this.choose_winner(that, f'Anchors-ucid-I [CB4]', pipeline_locale)
+                            continue
+    
+    return entity_list
+
+def PIPE_Anchor_Reduction_II_UCID(entity_list: list, pipeline_locale: str):
+    """Specialty disambiguation function that uses exceptions + anchors to map some entities to each other
+    primarily by surname. This is a secondary implementation of disambiguation, stacked on top of the first layer
+    of anchor disambiguation
+
+    Args:
+        entity_map (list): list of nodes in a ucid we are trying to reduce
+        pipeline_locale (str): where in the disambiguation pipeline this is being called (for logging)
+
+    Returns:
+        list: the same list that entered, but the child objects in the lists may be updated and disambiguated
+    """
+    # print("\nPipe: Anchor Reduction II within UCIDs")
+    eligible_list = [o for o in entity_list if o.eligible]
+
+    start = 0
+    # start with all entities
+    it_list = eligible_list[start:]
+    # while we are still comparing all entities
+    while it_list:
+        this = eligible_list[start] # current judge
+        those = eligible_list[start+1:] # other judges to compare to
+
+        start+=1 # update iterables
+        it_list = eligible_list[start:] # update iterables
+
+        # eligible search for disambiguation
+        search = [o for o in those if o.eligible]
+        if search and this.eligible:
+            for that in search: # for other judges on the ucid
+                # if the surnames match at 90% or more
+                if fuzz.ratio(this.anchor, that.anchor)>=90:
+                    # anchors >90% and tokens all above 98%
+                    if fuzz.token_set_ratio(this.base_tokens, that.base_tokens) >=98:
+                        this.choose_winner(that,f"Anchors-ucid-II [CB1]", pipeline_locale)
+                        continue
+                    # one of the entities was just a surname
+                    if this.token_length==1 and that.token_length>1 or this.token_length>1 and that.token_length==1:
+                        this.choose_winner(that,f"Anchors-ucid-II [CB2]", pipeline_locale)
+                        continue
+                # if one is a surname and the other is 2 tokens
+                if this.token_length==2:
+                    if len(this.base_tokens[0])==1 or len(this.base_tokens[-1])==1:
+                        # try fuzing the 2-token name into one and see if there was a misc. letter
+                        # i.e. "Gelpi" vs. "Gelp i"
+                        this_alt_anchor = "".join(this.base_tokens)
+                        if fuzz.ratio(this_alt_anchor, that.anchor)>=95:
+                            this.choose_winner(that,f"Anchors-ucid-II [CB3]", pipeline_locale)                            
+                            continue
+                # if both multitoken
+                if this.token_length>=2 and that.token_length>=2:
+                    # if they are long names and the last tokens first letter doesnt match, fail out
+                    if this.token_length>=3 and that.token_length>=3:
+                        if this.tokens_wo_suff[1][0] != that.tokens_wo_suff[1][0]:
+                            continue
+                    # try comparing the first and last tokens individually in the names
+                    if fuzz.ratio(this.tokens_wo_suff[0],that.tokens_wo_suff[0])>=90 and \
+                        fuzz.ratio(this.tokens_wo_suff[-1],that.tokens_wo_suff[-1])>=90:
+                        # now ensure no disjointed middle initial
+                        # Karen J Williams and Karen M Williams
+                        if len(this.tokens_wo_suff)==3 and len(that.tokens_wo_suff)==3 \
+                            and this.tokens_wo_suff[1]!= that.tokens_wo_suff[1]:
+                            continue
+                        else:
+                            this.choose_winner(that,f"Anchors-ucid-II [CB4]", pipeline_locale)                            
+                            continue
+                # compare if the longer entity had dual last names and the short entity matched one of them
+                # basically: this = Smith Washington | that = Smith Washington Jones
+                if this.token_length==2 and that.token_length>2:
+                    if fuzz.ratio(this.tokens_wo_suff[0],that.tokens_wo_suff[-2])>=90 and \
+                        fuzz.ratio(this.tokens_wo_suff[1],that.tokens_wo_suff[-1])>=90:
+                        this.choose_winner(that,f"Anchors-ucid-II [CB5]", pipeline_locale)
+                        continue
+    return entity_list
+
+def PIPE_Anchor_Reduction_III_UCID(entity_list: list, pipeline_locale: str):
+    """Specialty disambiguation function that uses exceptions + anchors to map some entities to each other
+    primarily by surname. This is a third implementation of disambiguation, stacked on top of the first and
+    second layer of anchor disambiguation
+
+    Args:
+        entity_map (list): list of nodes in a ucid we are trying to reduce
+        pipeline_locale (str): where in the disambiguation pipeline this is being called (for logging)
+
+    Returns:
+        list: the same list that entered, but the child objects in the lists may be updated and disambiguated
+    """
+    eligible_list = [o for o in entity_list if o.eligible]
+
+    start = 0
+    it_list = eligible_list[start:]
+    while it_list:
+        this = eligible_list[start] # object for comparison
+        those = eligible_list[start+1:] # list of other objects for comparison
+
+        start+=1 # update iterables
+        it_list = eligible_list[start:] # update iterables
+
+        # eligible to be matched
+        search = [o for o in those if o.eligible]
+        if search and this.eligible:
+            for that in search: # for all other judge names on the ucid we are comparing to
+                # running only for longer names
+                if this.token_length>=2:
+                    # against longer names
+                    if that.token_length>=2:
+                        # if the suffixless names match and the anchors (surnames match)
+                        if fuzz.ratio(this.tokens_wo_suff[0], that.tokens_wo_suff[0])>=90 and fuzz.ratio(this.tokens_wo_suff[-1], that.tokens_wo_suff[-1])>=90:
+                            # GOOD MATCH
+                            this.choose_winner(that, f"Anchors-ucid-III [CB1]", pipeline_locale)                                
+                            continue
+                        # if a mashed string form matches strongly, then it's probably misspelling or misc. letters junking up the match and its good
+                        if fuzz.ratio("".join(this.base_tokens), "".join(that.base_tokens))>=95:
+                            this.choose_winner(that, f"Anchors-ucid-III [CB2]", pipeline_locale)                                
+                            continue
+                    
+                    # if the first token is a letter and it's "j" assume it stands for judge, or jude stands for judge
+                    if (len(this.base_tokens[0])==1 and this.base_tokens[0]=='j') or this.base_tokens[0]=='jude':
+                        # assume this entity is a single surname then and attempt matching without the j or jude
+                        this_alt_anchor = this.base_tokens[1]
+                        if fuzz.ratio(this_alt_anchor, that.anchor)>=92:
+                            this.choose_winner(that, f"Anchors-ucid-III [CB3]", pipeline_locale)                                
+                            continue
+                    
+                    # mashed string forms of the entity names
+                    thisjoin = ".".join(this.base_tokens)
+                    thatjoin = ".".join(that.base_tokens)
+                    # if the smashed forms have a decent match
+                    if thisjoin in thatjoin or thatjoin in thisjoin or fuzz.ratio(thisjoin, thatjoin)>=92:
+                        # they need to be longer than 3 letters (initials not considered here like CJR)
+                        if len("".join(this.base_tokens))<=3 or len("".join(that.base_tokens))<=3:
+                            # bad match
+                            continue
+                        # single token names from headers are usually just initials and cannot confidently be handled here
+                        if (this.token_length ==1 and this.was_header) or (that.token_length ==1 and that.was_header):
+                            #bad match
+                            continue
+                        
+                        # if we didnt fail out, then the mashed names worked and we say they match
+                        this.choose_winner(that, f"Anchors-ucid-III [CB4]", pipeline_locale)
+                            
+    return entity_list
+
+def PIPE_Anchor_Reduction_Court(court_long: list, court_short: list, court: str):
+    """Special function to work anchor matching (matching by surname only) into the court level disambiguation
+
+    Args:
+        court_map_long (list): list of entity objects whose names are multi-tokened
+        court_map_single (list): list of entity objects whose names are single-tokened
+        court (str): which court in the disambiguation pipeline this is being called (for logging)
+
+    Returns:
+        list: list of entity objects reduced in the court
+    """
+
+    # only check what is eligible at this point
+    longs = [o for o in court_long if o.eligible]
+    singles = [o for o in court_short if o.eligible]
+
+    # for every uni-token entity
+    for each in singles:
+        # init matching nothing
+        matches = []
+        # compare to every long name
+        for l in longs:
+            # possessive quickcheck:
+            if each.anchor == f"{l.anchor}s" or l.anchor == f"{each.anchor}s":
+                matches.append(l)
+        
+            # if the characters are slightly typoed, this catches them
+            elif fuzz.ratio(each.name, l.anchor)>=80 and Counter(each.name) == Counter(l.anchor):
+                matches.append(l)
+        
+        # if matches were found, confirm there were no ambiguous surname mappings
+        if matches:
+            each.assess_ambiguity(matches, "court_layer_crossover",court)
+
+    # pool the entity lists into one large list    
+    final_map = court_long+court_short
+
+    return final_map
+
+##############################
+## Fuzzy Matching Functions ##
+##############################
+
+#------------#
+# UCID/COURT #
+#------------#
+
+def PIPE_Fuzzy_Matching(entity_list: list, pipeline_locale: str):
+    """fuzzy matching to be used for intra-ucid or intra-court disambiguation
+
+    Args:
+        entity_map (list): list of objects per ucid or court that will be reduced onto each other
+        pipeline_locale (str): where in the disambiguation pipeline this is being called (for logging)
+
+    Returns:
+        list: same list that entered the function, but the child objects will be updated in some cases after reduction
+    """
+    # print("\nPipe: Fuzzy Matching")
+    
+    eligible_list = [o for o in entity_list if o.eligible]
+
+    start = 0 # iterables
+    it_list = eligible_list[start:] # iterables
+    # comparison is bidirectional such that A compared to B is equivalent to B compared to A
+    # when we enumerate out the list of comparisons it is effectively like: [A, B, C, D]
+    # --> AB, AC, AD, BC, BD, CD
+    while it_list: # go until we reach the end of the list
+        this = eligible_list[start] # entity to compare
+        those = eligible_list[start+1:] # other entities we compare to
+        start+=1 # iterables
+        it_list = eligible_list[start:] # the next loop
+
+        # only want eligible entities. Eligible means another entity can point to it and be disambiguated to it and this entity does not point elsewhere
+        search = [o for o in those if o.eligible]
+        if search: # if there are eligible ones
+            for that in search:
+                # if each entity appeared on more than 20 ucids OR
+                # one of the entities appeared much more frequently than the other
+                # loosen the bound a bit, more common occurrences == more leeway for typos
+                bound = 93
+                if this.n_ucids and that.n_ucids:
+                    if (this.n_ucids/that.n_ucids)>20 or (that.n_ucids/this.n_ucids)>20:
+                        bound = 90  
+
+                # if they fuzzy matched, hooray
+                if fuzz.ratio(this.name, that.name) >=bound:
+                    # object routine to reduce the objects with each other
+                    this.choose_winner(that, "UCIDFuzzy", pipeline_locale)
+
+    return entity_list
+
 
 ##################################
 ## Party/Counsel Fuzzy Matching ##
 ##################################
 
-def UCID_PIPE_Drop_Parties(ucid_map, parties_df, counsels_df):
+def UCID_PIPE_Drop_Parties(ucid_map: dict, parties_df: pd.DataFrame, counsels_df: pd.DataFrame):
     """Function used in the first round of large-scale disambiguation. We use this to omit any party or counsel names that
     the spacy model mistook to be judges. We do this using the known party and counsel names from header metadata.
 
@@ -900,7 +993,7 @@ def UCID_PIPE_Drop_Parties(ucid_map, parties_df, counsels_df):
         dict, dict: one dictionary is the one containing the entities we want to advance to disambiguation, the other is a log of which entities we threw out
     """
     
-    def _check_if_party(entity_obj, party_names):
+    def _check_if_party(entity_obj: JCL.UCIDMatch, party_names: list):
         """helper function to compare if an entity object is in a list of party names by fuzzy matching
 
         Args:
@@ -965,6 +1058,7 @@ def UCID_PIPE_Drop_Parties(ucid_map, parties_df, counsels_df):
     for ucid, entities in tqdm.tqdm(ucid_map.items()):
         # if we didnt have parties for the case, that's shocking but move along I guess
         if ucid not in parties:
+            new_map[ucid] = entities
             continue
         # grab the parties (parties and counsels)
         case_parties = parties[ucid]
@@ -1012,22 +1106,29 @@ def pool_runner(this_pool: list, that_pool: list):
                 # anchor a (surname)
                 ta = tokey_a[0]
                 # anchor b (surname)
+                # note these are strings and not the actual objects themselves
                 tbL = tokey_b[-2] if tokey_b[-1] in JG.suffixes_titles else tokey_b[-1]     
                 # if the surnames dont match, move on fast
                 if ta!=tbL:
                     continue  
+                else:
+                    # if the surnames match, its good
+                    return True
             # vice versa
             if len(tokey_b)==1 and len(tokey_a)>1:
                 tb = tokey_b[0]
                 taL = tokey_a[-2] if tokey_a[-1] in JG.suffixes_titles else tokey_a[-1]
                 if tb!=taL:
                     continue   
+                else:
+                    # if the surnames match, its good
+                    return True
             # if you made it here, call the sub function
             if tokens_in_tokens_sub_function_caller(tokey_a, tokey_b):
                 return True
     return False
     
-def pool_creator(this, that, abbreviated_first, abbreviated_middle, style):
+def pool_creator(this: JCL.IntraMatch, that: JCL.IntraMatch, abbreviated_first: bool, abbreviated_middle: bool, style: str):
     """Given 2 entities, and abbreviation and style arguments, create the pools of tokens necessary for a tokens in tokens check to be run.
     Examples of the pools for a middle initial = True
     - A: "Christian John Michael Rozolis" --> [[Christian J M Rozolis],[Christian John M Rozolis],[Christian J Michael Rozolis]]
@@ -1064,113 +1165,149 @@ def pool_creator(this, that, abbreviated_first, abbreviated_middle, style):
 # UCID/COURT #
 #------------#
 
-def PIPE_Tokens_in_Tokens(entity_map: dict,
-                            abbreviated_first: bool = False, abbreviated_middle: bool = False,
+def PIPE_Tokens_in_Tokens(entity_list: list, pipeline_locale: str,
+                            abbreviated_first: bool = False, 
+                            abbreviated_middle: bool = False,
                             style: str = 'Plain'):
     """High volume function called in UCID and COURT level disambiguation. This is used to determine by ucid
     if any of the entities are tokenized subsets of the other entities tokens
     Example: St Eve is a tokenized subset of Amy Joan St Eve
-    Amy J St Eve is an abbreviated tokenied subset of A J St Eve
+    Amy J St Eve is an abbreviated tokenized subset of A J St Eve
 
     Args:
-        entity_map (dict): key = ucid/court, values = list of entity objects in that key-based group
+        entity_map (list): list of entity objects in that key-based group
+        pipeline_locale (str): where in the disambiguation pipeline this is being called (for logging)
         abbreviated_first (bool, optional): should we abbreviate the first token in this run. Defaults to False.
         abbreviated_middle (bool, optional): should we abbreviate the middle token[s] in this run. Defaults to False.
         style (str, optional): How should we build and compare entitiy names (as is plain, nicknames, universal spellings). Defaults to 'Plain'.
 
     Returns:
-        dict: key = ucid/court, values = list of entity objects in that key-based group that have been reduced
+        list: list of entity objects in that key-based group that have been reduced
     """
-    print(f"\nPipe: Tokens in Tokens -- {style} -- AF={int(abbreviated_first)} AM={int(abbreviated_middle)}")
 
     # for every ucid or court
-    for key, objs in tqdm.tqdm(entity_map.items()):
-        start = 0 # iterables
-        it_list = objs[start:] # iterables
-        while it_list:
-            this = objs[start] # object to compare
-            those = objs[start+1:] # other objects to compare to
-            
-            start+=1 # iterables
-            it_list = objs[start:] # iterables
+    eligible_list = [o for o in entity_list if o.eligible]
 
-            # only want eligible objects
-            search = [o for o in those if o.eligible]
-            if search:
-                # for every object eligible to be compared
-                for that in search:
-                    # create the pools of tokens
-                    this_pool, that_pool = pool_creator(this, that, abbreviated_first, abbreviated_middle, style)
-                    # run the pools through the tokens in tokens check
-                    if pool_runner(this_pool, that_pool):
-                        # if they match, reduce them
-                        this.choose_winner_ucids(that, f'TIT-{int(abbreviated_first)}{int(abbreviated_middle)}-{style}', key)
+    start = 0 # iterables
+    it_list = eligible_list[start:] # iterables
+    while it_list:
+        this = eligible_list[start] # object to compare
+        those = eligible_list[start+1:] # other objects to compare to
+        
+        start+=1 # iterables
+        it_list = eligible_list[start:] # iterables
 
-    return entity_map
+        # only want eligible objects
+        search = [o for o in those if o.eligible]
+        if search:
+            # for every object eligible to be compared
+            for that in search:
+                # create the pools of tokens
+                this_pool, that_pool = pool_creator(this, that, abbreviated_first, abbreviated_middle, style)
+                # run the pools through the tokens in tokens check
+                if pool_runner(this_pool, that_pool):
+                    # if they match, reduce them
+                    this.choose_winner(that, f'TIT-{int(abbreviated_first)}{int(abbreviated_middle)}-{style}', pipeline_locale)
 
-#--------------#
-# Unrestricted #
-#--------------#
+    return entity_list
 
-def PIPE_Free_Tokens_in_Tokens(NODES: list,
-                            abbreviated_first: bool = False, abbreviated_middle: bool = False,
-                            style: str = 'Plain'):
-    """Pipe function to be used in Free-matching disambiguation that checks if 2 entities tokenized names are subsets of each other
+def PIPE_UCID_COURT_INITIALISMS(entity_list_long: list, court: str):
+    """Given a list of multi-token names in a court, determine if they match to each other
+    by initials based matching patterns. No ambiguity is presumed at this step
 
     Args:
-        NODES (list): list of objects to be reduced in free matching
-        abbreviated_first (bool, optional): should we abbreviate the first token in this run. Defaults to False.
-        abbreviated_middle (bool, optional): should we abbreviate the middle token[s] in this run. Defaults to False.
-        style (str, optional): How should we build and compare entitiy names (as is plain, nicknames, universal spellings). Defaults to 'Plain'.
+        entity_list_long (list): list of IntraMatch objects in a ucid/court we are trying to reduce
+        court (str): used for logging to indicate where in the pipeline the matching is happening
 
     Returns:
-        list: the same list that entered the function, but now some of the objects point to each other
+        list: same list that entered the function, but the object attributes are updated to point to each other
     """
-    print(f"\nPipe: Tokens in Tokens -- {style} -- AF={int(abbreviated_first)} AM={int(abbreviated_middle)}")
-    # only want eligible ones
-    objs = [N for N in NODES if N.eligible]
+
+    # now inside of a court
+    # empty list of possible nodes to match
+    matchy = []
+    # check only those eligible
+    for each in [o for o in entity_list_long if o.eligible]:
+        # if the name is:
+        #    3 tokens long,
+        #    doesnt have a suffix,
+        #    the surname is one letter,
+        #    the first name is multiple characters,
+        #    and the middle initial is one letter
+        # i.e. Irene Patricia Murphy Kelly was frequently written as Irene M K
+        # then consider it for matching
+        if each.token_length == 3 and\
+            not each.suffix and \
+            len(each.anchor)==1 and \
+            len(each.base_tokens[0])>2 and \
+            len(each.base_tokens[1])==1:
+            matchy.append(each)
+    # for all eligible to be matched
+    for m in matchy:
+        # compare against all long names
+        for n in [o for o in entity_list_long if o.eligible and o!=m and o.token_length>=3]:
+            # if the first letters match across the board and the first names match
+            if n.base_tokens[0] == m.base_tokens[0] and \
+                n.base_tokens[1][0] == m.base_tokens[1][0] and\
+                n.base_tokens[2][0] == m.base_tokens[2][0]:
+                m.choose_winner(n, "Initialisms Styling, new rules", court)
+                # print(f"NEW STYLE: {m.name} -- {n.name} {court}") # dev messaging
+            # if the first names match and the offset tokens from a longer name match
+            # i.e. Chris John Rozolis Stevens and Chris Rozolis Stevens
+            elif len(n.base_tokens)>3 and n.base_tokens[0] == m.base_tokens[0] and \
+                n.base_tokens[2][0] == m.base_tokens[1][0] and\
+                n.base_tokens[3][0] == m.base_tokens[2][0]:
+                m.choose_winner(n, "Initialisms", court)
+                # print(f"NEW STYLE: {m.name} -- {n.name} {court}") # dev messaging
+
+    return entity_list_long
+
+def PIPE_COURT_Anchors_Self_Reduction(entity_list_short: list, court: str):
+    """Given a list of single tokens within a court, reduce them among each other for synonymous
+    entities. This works for possessive vs. singular entities (i.e. Smith and Smiths match). It
+    is okay if they are different Smiths because we can never allocate them to the correct Smith, and would
+    all be mapped as ambiguous through the same core entity denoting them as "Smith"
+
+    Args:
+        entity_list_short (list): list of IntraMatch objects in a ucid/court we are trying to reduce
+        court (str): used for logging to indicate where in the pipeline the matching is happening
+
+    Returns:
+        list: same list that entered the function, but the object attributes are updated to point to each other
+    """
+    # only consider those entities that remained eligible upon entering this function
+    eligible_list = [o for o in entity_list_short if o.eligible]
     
     start = 0 # iterables
-    it_list = objs[start:] # iterables
+    it_list = eligible_list[start:] # iterables
     while it_list:
-        this = objs[start] # object to compare
-        those = objs[start+1:] # objects to be compared
-
+        this = eligible_list[start] # object to compare
+        those = eligible_list[start+1:] # other objects to compare to
+        
         start+=1 # iterables
-        it_list = objs[start:] # iterables
+        it_list = eligible_list[start:] # iterables
 
-        # function not equipped to handle single token entities.
-        # We DONT want to match Brown to Brown in freematching, since we dont know they are truly the same across courts
-        if this.token_length==1:
-            continue
-        # eligible entities
+        # only want eligible objects
         search = [o for o in those if o.eligible]
         if search and this.eligible:
             for that in search:
-                # again VETO single-token entities
-                if that.token_length==1:
-                    continue
-                # create a pool of tokens to use in comparison
-                this_pool, that_pool = pool_creator(this, that, abbreviated_first, abbreviated_middle, style)
+                # possessive quickcheck:
+                if this.anchor == f"{that.anchor}s" or that.anchor == f"{this.anchor}s":
+                    this.choose_winner(that, f'Anchor Self-Reduction in Court Matching', court)
+                
+                # surnames have lower threshold as they are single tokens
+                if fuzz.ratio(this.name, that.name)>80 and Counter(this.name) == Counter(that.name):
+                    this.choose_winner(that, f'Anchor Self-Reduction in Court Matching', court)
+        
+    return entity_list_short
 
-                # run the pools against each other
-                if pool_runner(this_pool, that_pool):
-                    # if this entity is 2 tokens and one of the tokens is a single letter, VETO, dont want to consider in free-matching
-                    if this.token_length == 2 and min(len(tok) for tok in this.base_tokens)==1:
-                        continue
-                    # same concept, vice versa
-                    if that.token_length == 2 and min(len(tok) for tok in that.base_tokens)==1:
-                        continue
-                    # if not, if the pools matched, reduce them, hooray
-                    this.choose_winner(that, f'Free TIT-{int(abbreviated_first)}{int(abbreviated_middle)}-{style}')
 
-    return NODES
 
 #########################################################
 # Helper that calls the tokens in tokens check in both 
 # directions for lists (list a in b or list b in a)
 #########################################################
-def tokens_in_tokens_sub_function_caller(tokens_a, tokens_b):
+def tokens_in_tokens_sub_function_caller(tokens_a: list, tokens_b: list):
     """helper function to run through the tokens in tokens checker
 
     Args:
@@ -1195,7 +1332,7 @@ def tokens_in_tokens_sub_function_caller(tokens_a, tokens_b):
         return False
 
 
-def tokens_in_tokens_sub_function(tokens_1, tokens_2):
+def tokens_in_tokens_sub_function(tokens_1: list, tokens_2: list):
     """ This is the sub-function that will token-wise compare 2 lists and determine if list_1
     is wholly present in list_2. Note sets() and Counters() cannot be compared since we need to account for
     dual names appearing i.e. [jo, jo, smith] or [george, h, george] and account for their order of appearance
@@ -1294,7 +1431,10 @@ def tokens_in_tokens_sub_function(tokens_1, tokens_2):
     else:
         return False
 
-def tokens_in_string_algo(tokens, string_check):
+############################
+#### DEPRECATED ALGORITHM ##
+############################
+def tokens_in_string_algo(tokens: list, string_check: str):
     """Helper function used to determine if a list of tokens is wholly present in a string, in the proper order
     For example A A Milne is wholly in Robert A Milne  with just substrings, but this function confirms that 
     2 A's needed to appear in Robert A Milne as standalone tokens to qualify as "in the string"

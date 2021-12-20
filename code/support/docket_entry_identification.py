@@ -561,3 +561,31 @@ def extract_court_caseno(hstring, debug_name=''):
     court = cfunc.classify(court_header_str)
 
     return court, case_no
+
+def identify_docket_table(soup):
+    '''
+    Identify which table in a docket report is the docket sheet table.
+    Uses identification on the first cell text equalling 'Date Filed'
+
+    Inputs:
+        - soup (bs4.BeautifulSoup): the soup of the entire page of a docket sheet html
+    Output:
+        (bs4.element.Tag) The tag that is the docket table.
+        Returns None if no docket found (including if the matches the criteria of ftools.re_no_docket)
+    '''
+    # Return none if any of the 'no docket' language detected
+    if any(x for x in soup.find_all('h2') if re.search(ftools.re_no_docket, x.text)):
+        return None
+
+
+    # Iterate in reverse over all tables
+    tables = soup.select('table')
+    for table in tables[::-1]:
+        first_cell = table.select_one('td,th')
+
+        # Catch for if table has no cells
+        if not first_cell:
+            continue
+        # Strip and lower text of the first cell
+        elif first_cell.text.lower().strip() == 'date filed':
+            return table

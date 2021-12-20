@@ -1,5 +1,6 @@
 import sys
-sys.path.append('../../../../')
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parents[4]))
 import support.data_tools as dtools
 
 import pandas as pd
@@ -27,14 +28,20 @@ if __name__ == "__main__":
     # normally this would be new cases filtered (testing was 2020+ were new)
     # we use our docket lookup to generate our list of "ucids to update" -- those filed in 2020 and later
     dockets = dtools.load_unique_files_df()
-    dockets = dockets[dockets.year>=2020]
+    dockets = dockets[dockets.index.isin(
+        list(entries_df.ucid.unique()) + list(heads_df.index.unique())
+        )]
 
     # read in FJC data, we will use it to shrink the pool of JEL nodes we compare against in tagging
     # basically, we probably won't be tagging judges from the 1800s and early 1900s so remove them for efficiency
     fjc_active = JCF.ingest_the_fjc(
-        cfg['FJC']['fjc_file'],
-        low = cfg['FJC']['Low'],
-        high = cfg['FJC']['High']) 
+        cfg['FJC']['fjc_file']) 
+
+    ba_mag = JCF.ingest_ba_mag(
+        cfg['BA_MAG']['judges'], 
+        cfg['BA_MAG']['positions']
+        )
+
     FJC_Terms = fjc_active.groupby(['FullName','nid'], as_index=False)['Termination Date'].max()
     FJC_Terms.columns = FJC_Terms.columns.droplevel(1) # we hate pandas multi-indexes :(
 
@@ -43,19 +50,22 @@ if __name__ == "__main__":
     
     # cut the JEL FJC judges that we know were terminated before 2014 (new cases for now are anticipated to be 2021+)
     Qualified_JEL = JEL.merge(FJC_Terms[['nid','Termination Date']], how='left', left_on='NID', right_on='nid')
-    
     Compy_JEL = Qualified_JEL[
         (Qualified_JEL['Termination Date'].isna())|
         (Qualified_JEL['Termination Date'] >= pd.to_datetime(cfg['FJC']['Active_Period']).date())]
 
+    Compy_JEL.drop(["Termination Date","nid"], axis=1, inplace=True)
+
     # prep the incoming new data for disambiguation
-    UDF = JP.PIPELINE_Disambiguation_Prep(entries_df, heads_df, dockets)
+    # NEED TO RE ADD TRIE BASED RE-EXTRACTIONS
+    UDF = JP.PIPELINE_Disambiguation_Prep(entries_df, heads_df, Compy_JEL)
+
     # do ucid level disambiguation on the incoming data before we try mapping it to known JEL entities
     Post_UCID = JP.UCID_MATCH_PIPELINE(UDF, parties, counsels)
 
     # # run the updater function using the new data and existing JEL nodes for comparisons
-    PDF = JA.assess_new_cases(Post_UCID, Compy_JEL)
+    out = JP.PIPE_Assess_New_Cases(Post_UCID, Compy_JEL)
 
-    # # write out the updated JSONLs for the new cases
+    # # # write out the updated JSONLs for the new cases
     paths = cfg['OUT_PATHS']
-    JU.UPDATE_TO_JSONL(PDF,paths)
+    JU.UPDATE_TO_JSONL(out,paths)

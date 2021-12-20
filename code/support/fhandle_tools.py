@@ -16,6 +16,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from support import settings
 from support import data_tools as dtools
 from support import docket_entry_identification as dei
+from support.core import std_path
 
 # Default runtime hours
 PACER_HOURS_START = 20
@@ -26,10 +27,13 @@ FMT_TIME = '%Y-%m-%d-%H:%M:%S'
 FMT_TIME_FNAME ='%y%m%d'
 FMT_PACERDATE = '%m/%d/%Y'
 
-GODLS = {
-    # Ordered list of goDLS arguments
-    'args': ['action', 'caseid', 'de_seq_num','got_receipt','pdf_header',
-             'pdf_toggle_possible', 'magic_num', 'hdr']
+SUBDIR_EXTENSIONS = {
+    'json': 'json',
+    'html': 'html',
+    'summaries': 'html',
+    'members': 'html',
+    'history': 'html',
+    'docs': 'pdf'
 }
 
 # Patterns
@@ -179,67 +183,6 @@ def clean_case_id(case_no, allow_def_stub=False, lower_type=False):
     except ValueError:
         return case_no
 
-def parse_document_no(doc_no):
-    ''' Take input for document numbers (for a single case) and parse
-    Input:
-        - doc_no (str): a comma-delimited list of doc nos that can be one of 3 things:
-                        [1: a single doc e.g. 3][2: an attachment e.g. 3_1][3: a range e.g. 5:7 (inclusive)]
-    Output:
-        wanted_doc_nos: a dict of (row number, list of docs) key-value pairs where '0' is a placeholder to dowload the line doc
-                        e.g. { '1': ['0', '4', '5'],  '2': ['0'], '3': ['9'] }
-    '''
-    re_doc = r'^\d+$'
-    re_att = r'^\d+_\d+(\:\d+)?$'
-    re_range = r'^\d+\:\d+$'
-
-    doc_no = str(doc_no).replace(' ','').strip()
-    doc_list = []
-
-    # Parse all to extrapolate from ranges
-    chunks = doc_no.split(',')
-    for chunk in chunks:
-
-        # For line doc e.g. just "3"
-        if re.match(re_doc, chunk):
-            doc_list.append(chunk)
-
-        # Attachment
-        elif re.match(re_att, chunk):
-            doc, att = chunk.split('_')
-
-            # x_y
-            if re.match(re_doc, att):
-                doc_list.append(chunk)
-
-            # x_y:z
-            elif re.match(re_range, att):
-                a,b = [int(x) for x in att.split(':')]
-                doc_list.extend([f"{doc}_{x}" for x in range(a, b+1)])
-
-        # Range (x:y)
-        elif re.match(re_range, chunk):
-            a,b = [int(x) for x in chunk.split(':')]
-            doc_list.extend([str(x) for x in range(a,b+1)])
-
-    # Sort the list, need the assumption of sorted for next part
-    doc_list = sorted(set(doc_list))
-
-    # After extrapolation of ranges compile a dict of results
-    wanted_doc_nos = {}
-    for doc_no in doc_list:
-        if re.match(re_doc, doc_no):
-            wanted_doc_nos[doc_no] = []
-            wanted_doc_nos[doc_no].append('0')
-
-        elif re.match(re_att, doc_no):
-            line_no, att_no = doc_no.split('_')
-            if line_no not in wanted_doc_nos.keys():
-                wanted_doc_nos[line_no] = []
-
-            wanted_doc_nos[line_no].append(att_no)
-
-    return wanted_doc_nos
-
 def generate_document_id(ucid, index, att_index=None, ):
     '''
     Generate a unique id name for case document download
@@ -269,8 +212,17 @@ def generate_document_fname(doc_id, user_hash, ext='pdf'):
     file_time = datetime.now().strftime(FMT_TIME_FNAME)
     return f"{doc_id}_u{user_hash}_t{file_time}.{ext}"
 
-def parse_document_fname(fname):
-    ''' Parse a document filename, return the component parts as a dict'''
+def parse_document_fname(fname, parse_ucid_data=False):
+    '''
+    Parse a document filename, return the component parts as a dict.
+    Note this can take the old format of document filnemae (that didn't include the user and timestamp parts)
+
+    Inputs:
+        - fname (str): a document filename e.g. "ilnd;;1-16-cv-11315_20_u7905a347_t201007.pdf"
+        - parse_ucid_data (bool): whether to also parse the ucid data, and store that under the 'ucid_data' key
+    Output:
+        (dict) metadata coming from the filename e.g.
+    '''
 
     res = {}
 
@@ -293,6 +245,9 @@ def parse_document_fname(fname):
     if res.get('download_time'):
         res['download_time'] = datetime.strptime(res['download_time'], FMT_TIME_FNAME)
 
+    if res and parse_ucid_data:
+        parsed_ucid= dtools.parse_ucid(res['ucid'])
+        res['ucid_data'] = {'court':parsed_ucid['court'], **decompose_caseno(parsed_ucid['case_no'])}
     return res
 
 
@@ -387,22 +342,39 @@ def docket_aggregator(fpaths, outfile=None):
 
         # Assuming json implies recap
         elif fpath.suffix == '.json':
-            rjdata = dtools.remap_recap_data(fpath)
-            # Grab the recap docketlines
-            extra['recap_docket'].extend(rjdata['docket'])
-            extra['recap_id'] = rjdata.get('recap_id')
+            # Grab the recap docketlines (cribbing the relevant code from remap_recap_data so we don't need to call that function)
+            try:
+                recap_fpath = std_path(fpath)
+                jpath = settings.PROJECT_ROOT / recap_fpath
+                rjdata = json.load(open(jpath))
+                extra['recap_docket'].extend(dtools.get_recap_docket(rjdata['court'], rjdata['docket_entries']))
+                extra['recap_id'] = rjdata['id'] or None
+            except:
+                print(f"Error loading file {recap_fpath}")
+                extra['recap_id'] = None
+            # rjdata = dtools.remap_recap_data(fpath)
+            # extra['recap_docket'].extend(rjdata['docket'])
+            # extra['recap_id'] = rjdata.get('recap_id')
 
 
     # Check if need to create empty docket table for most recent docket (otherwise uses newest docket)
     if not dei.is_docket_table(docket_table):
+        replace_tag, after_tag = None, None
         docket_table = build_empty_docket_table(soup)
         # Find "There are proceedings" text
         try:
             replace_tag = soup.select('h2[align="center"]')[-1]
         except:
-            # Fallback, use last horizontal line
-            replace_tag = soup.select('hr')[-1]
-        replace_tag.replace_with(docket_table)
+            try:
+                # Fallback: use last horizontal line
+                replace_tag = soup.select('hr')[-1]
+            except:
+                # Double-fallback: insert at the very bottom
+                after_tag = soup.select('table')[-1]
+        if replace_tag:
+            replace_tag.replace_with(docket_table)
+        else:
+            after_tag.insert_after(docket_table)
 
     # Insert all the rows
     header_row = docket_table.select_one('tr')
@@ -573,40 +545,50 @@ def get_pacer_url(court, page):
     elif page == 'summary':
         return base_url + 'cgi-bin/qrySummary.pl'
 
-def get_expected_path(ucid, ext=None, subdir=None, pacer_path=settings.PACER_PATH, def_no=None):
+def _get_expected_path_old_(ucid, subdir='json', pacer_path=settings.PACER_PATH, def_no=None):
     '''
     Find the expected path of case-level data files
 
     Inputs:
         - ucid (str): case ucid
-        - ext (str): file extension for path, 'json' or 'html'
         - subdir (str): the subdirectory to look in (see scrapers.PacerCourtDir), one of 'html', 'json', 'docs', 'summaries', 'members'
         - pacer_path (Path): path to pacer data directory
         - def_no (str or int): the defendant no., if specifying a defendant-specific docket
     Output:
         (Path) the path to where the file should exist (regardless of whether it does or not)
-
     '''
-    #Handle a bunch of defaults and backwards compatibility
-
-    # Defaults to case json
-    if (ext==None and subdir==None) or (ext=='json') or (subdir=='json'):
-        ext, subdir = 'json', 'json'
-
-    # Set ext to 'html' for summaries and members
-    elif subdir in ('summaries', 'members'):
-        ext, subdir = 'html', subdir
-
-    # If ext is 'html', subdir defaults to 'html'
-    elif ext=='html' or subdir=='html':
-        ext, subdir = 'html', 'html'
-
-
+    # Get the caseno from the ucid
     ucid_data = dtools.parse_ucid(ucid)
     court, case_no = ucid_data['court'], ucid_data['case_no']
+    # Build the filepath
+    ext = SUBDIR_EXTENSIONS[subdir]
     fname = generate_docket_filename(case_no, ext=ext, def_no=def_no)
 
     return pacer_path / court / subdir / fname
+
+def get_expected_path(ucid, subdir='json', pacer_path=settings.PACER_PATH, def_no=None, update_ind=None):
+    '''
+    Find the expected path of case-level data files
+
+    Inputs:
+        - ucid (str): case ucid
+        - subdir (str): the subdirectory to look in (see scrapers.PacerCourtDir), one of 'html', 'json', 'docs', 'summaries', 'members'
+        - pacer_path (Path): path to pacer data directory
+        - def_no (str or int): the defendant no., if specifying a defendant-specific docket
+        - update_ind (int): update index (for html files), passed through to generate_docket_filename
+    Output:
+        (Path) the path to where the file should exist (regardless of whether it does or not)
+    '''
+    # Get the caseno from the ucid
+    ucid_data = dtools.parse_ucid(ucid)
+    court, case_no = ucid_data['court'], ucid_data['case_no']
+    year_part = decompose_caseno(case_no)['year']
+
+    # Build the filepath
+    ext = SUBDIR_EXTENSIONS[subdir]
+    fname = generate_docket_filename(case_no, ext=ext, def_no=def_no, ind=update_ind)
+
+    return pacer_path / court / subdir / year_part / fname
 
 def filename_to_ucid(fname, court):
     fpath = Path(fname)
@@ -634,10 +616,13 @@ def get_doc_path(doc_id):
             otherwise returns None if document does not exist
     '''
     # Get the court from the doc_id
-    court = doc_id.split(';;')[0]
+    ucid, _ = doc_id.split('_', maxsplit=1)
+    court = dtools.parse_ucid(ucid)['court']
+    year_part = decompose_caseno(ucid)['year']
+    import pdb;pdb.set_trace()
 
-    # Use glob to get candidate list (will return attachments with subindexes e.g. "_3...", "_3_1...", "_3_2...")
-    cand = (settings.PACER_PATH/court/'docs').glob(doc_id+'*')
+    # Use glob to get candidate list (will also return attachments with subindexes e.g. "_3...", "_3_1...", "_3_2...")
+    cand = (settings.PACER_PATH/court/'docs'/year_part).glob(doc_id+'*')
     # Filter to the correct doc id
     for fpath in cand:
 
@@ -659,7 +644,7 @@ def get_doc_path_many(doc_idx, court):
     '''
 
     # Get all pdf filepaths within the docs subdirectory for the given court
-    it = (settings.PACER_PATH/court/'docs').glob('*.pdf')
+    it = (settings.PACER_PATH/court/'docs').glob('*/*.pdf')
 
     # Grab the doc id's from the filenames
     df = pd.DataFrame(it, columns=('existing_fpath',))

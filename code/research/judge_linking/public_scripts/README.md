@@ -1,8 +1,6 @@
-# PRESIDE-lm: SCALES-OKN Judicial Entity Recognition and Disambiguation
+# SCALES-OKN Judicial Entity Disambiguation (JED)
 
-This repository is a collection of scripts that constitute the **Judicial Entity Disambiguation Pipeline.** The PRESIDE-lm NER model weights are available at https://doi.org/10.5281/zenodo.5562888. 
-
-In federal court records, every docket contains multiple mentions of judges, singular and plural. Our task was to identify, extract, and disambiguate these judges.
+This repository is a collection of scripts that constitute the **Judicial Entity Disambiguation (JED) Pipeline.** In federal court records, every docket contains multiple mentions of judges, singular and plural. Our task was to identify, extract, and disambiguate these judges.
 
 The Federal Judicial Center publishes a [biographical dictionary](https://www.fjc.gov/history/judges/biographical-directory-article-iii-federal-judges-export) of Article III judges annually with appointments, commissions, and presiding courts. Notably, this list does not contain Article I judges (such as magistrates) nor district judges from Guam, Northern Mariana Islands, and the Virgin Islands. Our task was intended to identify and label the existing Article III judges appropriately as well as identify and label these other judicial entities.
 

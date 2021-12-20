@@ -129,6 +129,10 @@ def ingest_config(config_path):
             'Low': config['FJC']['commission_start'],
             'High': config['FJC']['commission_end']
         },
+        'BA_MAG':{
+            'judges': config['BA_MAG']['bm_path'],
+            'positions': config['BA_MAG']['bm_positions']
+        },
         'OUT_PATHS':{
             'JEL':jel_path,
             'SEL':sel_path,
@@ -251,6 +255,10 @@ def ingest_new_tagger_config(config_path):
             'High': config['FJC']['commission_end'],
             'Active_Period': config['FJC']['active_period_min']
         },
+        'BA_MAG':{
+            'judges': config['BA_MAG']['bm_path'],
+            'positions': config['BA_MAG']['bm_positions']
+        },
         'JEL': config['JEL']['jel_location'],
         'OUT_PATHS':{
             'Updated_SEL':sel_path,
@@ -369,10 +377,17 @@ def ingest_disambiguation_update_config(config_path):
             'Low': config['FJC']['commission_start'],
             'High': config['FJC']['commission_end']
         },
+        'BA_MAG':{
+            'judges': config['BA_MAG']['bm_path'],
+            'positions': config['BA_MAG']['bm_positions']
+        },
         'JEL': config['JEL']['jel_location'],
+        'SEL_UPDATE_YRS':{
+            'low': config['JEL']['update_priors_year_low'],
+            'high': config['JEL']['update_priors_year_high']},
         'OUT_PATHS':{
-            'New_JEL':jel_path,
-            'New_SEL':sel_path,
+            'JEL':jel_path,
+            'SEL':sel_path,
             'SEL_DIR':sel_dir
         }
     }
@@ -402,7 +417,7 @@ def UPDATE_TO_JSONL(Post_UCID, paths):
     PRE_SEL = Post_UCID[~((Post_UCID.SJID == "Inconclusive") & (Post_UCID.Prefix_Categories=="No_Keywords"))]
     # get relevant columns
     SEL = PRE_SEL[['Entity_Extraction_Method', 'docket_source', 'judge_enum', 'party_enum',
-        'pacer_id', 'docket_index', 'ucid', 'cid', 'court', 'year',
+        'pacer_id', 'docket_index', 'ucid', 'cid', 'court', 'year','entry_or_filing_date',
         'original_text','New_Entity', 'Prefix_Categories',
         'Transferred_Flag', 'full_span_start', 'full_span_end',
         'New_Span_Start', 'New_Span_End','Points_To','SJID']].copy()
@@ -417,59 +432,11 @@ def UPDATE_TO_JSONL(Post_UCID, paths):
     SEL.rename(columns=rename_cols, inplace=True)
     SEL.to_json(paths['Updated_SEL'], orient='records', lines=True)
 
-
-    # EXACT SAME CODE CONCEPT AS THE ORIGINAL WRITER FUNCTION BELOW
-    DATA = {}
-    temp = SEL[['court','year', 'ucid']].copy()
-    temp.drop_duplicates(inplace=True)
-    for court, year, ucid in temp.to_numpy():
-        if court not in DATA:
-            DATA[court] = {year:{ucid:[]}}
-        else:
-            if year not in DATA[court]:
-                DATA[court][year] = {ucid:[]}
-            else:
-                if ucid not in DATA[court][year]:
-                    DATA[court][year][ucid] = []    
-
-    basepath = paths["SEL_DIR"]
-
-    for court, years in DATA.items():
-        if not os.path.isdir(f"{basepath}/{court}/"):
-            os.mkdir(f"{basepath}/{court}/")
-        for year in years.keys():
-            if not os.path.isdir(f"{basepath}/{court}/{year}/"):
-                os.mkdir(f"{basepath}/{court}/{year}/")
-
-    for each in tqdm.tqdm(SEL.to_numpy(), total=len(SEL)):
-        ucid_index = list(SEL.columns).index('ucid')
-        court_index = list(SEL.columns).index('court')
-        year_index = list(SEL.columns).index('year')
-        
-        ucid = each[ucid_index]
-        court = each[court_index]
-        year = each[year_index]
-        
-        DATA[court][year][ucid].append({cn:e for cn,e in zip(list(SEL.columns),each)})
-
-    unwound = []
-    for court, stuff in DATA.items():
-        for year, more_stuff in stuff.items():
-            for ucid, data in more_stuff.items():
-                outfile = f"{paths['SEL_DIR']}/{court}/{year}/{ucid}.jsonl"
-                outfile = outfile.replace(";;","-").replace(":","-")
-                outdata = data
-                unwound.append((outfile, outdata))
-
-    
-    print("NOW WRITING TO FILE")
-    for fpath, datum in tqdm.tqdm(unwound):
-        with open(fpath, 'w') as fout:
-            json.dump(datum,fout)
+    write_SEL(SEL, paths)
 
     return
 
-def TO_JSONL(PRE_SEL, JEL, paths, single_file_or_multi = 'multi'):
+def TO_JSONL(PRE_SEL, JEL, paths):
     """Final Function that creates then writes the SEL files as well writes the JEL
 
     Args:
@@ -485,33 +452,45 @@ def TO_JSONL(PRE_SEL, JEL, paths, single_file_or_multi = 'multi'):
     PRE_SEL = PRE_SEL[~((PRE_SEL.SJID == "Inconclusive") & (PRE_SEL.Prefix_Categories=="No_Keywords"))]
     # select the columns we want in a particular order
     SEL = PRE_SEL[['Entity_Extraction_Method', 'docket_source', 'judge_enum', 'party_enum',
-           'pacer_id', 'docket_index', 'ucid', 'cid', 'court', 'year',
+           'pacer_id', 'docket_index', 'ucid', 'cid', 'court', 'year','entry_or_filing_date',
            'original_text','New_Entity', 'Prefix_Categories',
            'Transferred_Flag', 'full_span_start', 'full_span_end',
-           'New_Span_Start', 'New_Span_End','Final_Pointer','SJID']].copy()
+           'New_Span_Start', 'New_Span_End','Points_To','SJID','Ambiguous_SJIDS']].copy()
 
     # give them more understandable names
     rename_cols = {
         'New_Entity': 'Extracted_Entity',
     'New_Span_Start':'Entity_Span_Start' , 
     'New_Span_End':'Entity_Span_End' ,
-    'Final_Pointer':'Parent_Entity'}
+    'Points_To':'Parent_Entity'}
 
     SEL.rename(columns=rename_cols, inplace=True)
     
     # take specific columns from the JEL
     JEL = JEL[['name', 'Presentable_Name', 'SJID', 'SCALES_Guess', 
-       'Head_UCIDs', 'Tot_UCIDs', 'Full_Name', 'NID']].copy()
+       'Head_UCIDs', 'Tot_UCIDs', 'is_FJC','is_BA_MAG','NID', 'BA_MAG_ID']].copy()
 
     rename_cols = {'SCALES_Guess': 'SCALES_Judge_Label'}
     JEL.rename(columns=rename_cols, inplace=True)
     JEL.loc[~JEL.NID.isna(), "NID"] = JEL.NID.apply(lambda x: str(x).split(".")[0])
 
-    # if single_file_or_multi=='single':
     # write to files
     JEL.to_json(paths['JEL'], orient='records', lines=True)
     SEL.to_json(paths['SEL'], orient='records', lines=True)
 
+    write_SEL(SEL, paths)
+
+    return JEL, SEL
+
+def write_SEL(SEL: pd.DataFrame, paths: dict):
+    """this function writes out to files after disambiguation is complete
+
+    Args:
+        SEL (pd.DataFrame): The SEL dataframe that is going to be cut and written into individual jsonl files
+        paths (dict): the paths dictionary of where to do the writing
+    """
+
+    basepath = paths["SEL_DIR"]
     # else:
     DATA = {}
     # this is effectively the file list I need
@@ -534,7 +513,7 @@ def TO_JSONL(PRE_SEL, JEL, paths, single_file_or_multi = 'multi'):
                     DATA[court][year][ucid] = []
 
     # grab the path of the directory we are writing sel files to
-    basepath = paths["SEL_DIR"]
+    
 
     # for every iteration of court-years, make the directory for it
     for court, years in DATA.items():
@@ -554,7 +533,19 @@ def TO_JSONL(PRE_SEL, JEL, paths, single_file_or_multi = 'multi'):
         court = each[court_index]
         year = ucid.split(";;")[1].split(":")[1][0:2]
         
-        DATA[court][year][ucid].append({cn:e for cn,e in zip(list(SEL.columns),each)})
+        # make sure to cast all NULL and NaN as None
+        rowdat = {}
+        for cn,e in zip(list(SEL.columns),each):
+            if type(e)==list:
+                rowdat[cn] = e
+            else:
+                if pd.isnull(e):
+                    rowdat[cn] = None
+                else:
+                    rowdat[cn] = e
+
+        # DATA[court][year][ucid].append({cn:(e if not pd.isnull(e) else None) for cn,e in zip(list(SEL.columns),each)})
+        DATA[court][year][ucid].append(rowdat)
 
     # now we will unwind the DATA dict and write out the ucid-lists into their respective files
     # unwound will be a giant list of (fpath, [json-data-rows])
@@ -562,16 +553,17 @@ def TO_JSONL(PRE_SEL, JEL, paths, single_file_or_multi = 'multi'):
     for court, stuff in DATA.items():
         for year, more_stuff in stuff.items():
             for ucid, data in more_stuff.items():
-                outfile = f"{paths['SEL_DIR']}/{court}/{year}/{ucid}.jsonl"
-                outfile = outfile.replace(";;","-").replace(":","-")
+                # outfile = f"{paths['SEL_DIR']}/{court}/{year}/{ucid}.jsonl"
+                outfile = paths['SEL_DIR'] / Path(court) / Path(year) / Path(f"{ucid}.jsonl".replace(";;","-").replace(":","-"))
+                outfile = outfile.resolve()
+                # outfile = outfile.replace(";;","-").replace(":","-")
                 outdata = data
                 unwound.append((outfile, outdata))
 
     # go through the list and write it out
     print("NOW WRITING TO FILE")
     multiprocess_file_writer(unwound)
-
-    return JEL, SEL
+    return
 
 def multiprocess_file_writer(unwound):
     """Parallelized writing function that leverages the multiprocessing module for file writing all of the JSONLs
@@ -604,97 +596,232 @@ def write_to_jsonl_ucid_file(inp):
     return
 
 
-def UPDATED_DISAMBIGUATION_TO_JSONL(paths, Updated_JEL, Old_docks, New_docks):
-    """Final writing function when updating a full JEL and running disambiguation. This function will overwrite old SEL files and will also create new ones
+def UPDATE_WRITER(PRE_SEL: pd.DataFrame, newJEL: pd.DataFrame, dockets_old: pd.DataFrame, paths: dict):
+    """write out new SEL and JEL files after a disambiguation update run
 
     Args:
-        paths (dict): dict of local or absolute paths pointing towards the location for new SEL and JEL files
-        Updated_JEL (pandas.DataFrame): DF representing the new JEL entities
-        Old_docks (pandas.DataFrame): DF representing the old ucids we have run through disambiguation before but now have updated entity tags
-        New_docks (pandas.DataFrame): DF representing the new ucids we have now included in disambiguation
+        PRE_SEL (pd.DataFrame): The SEL dataframe that is going to be cut and written into individual jsonl files        
+        newJEL (pd.DataFrame): The new JEL to be writtne into a file
+        dockets_old (pd.DataFrame): the unique dockets table containing the prior tagged ucids from the previous disambiguation run
+        paths (dict): the paths dictionary of where to do the writing
     """
-    # discard SEL rows that were inconclusive and had no pretext indicators of judge-like terms
-    PRE_SEL = New_docks[~((New_docks.SJID == "Inconclusive") & (New_docks.Prefix_Categories=="No_Keywords"))]
 
-    # select the columns we want in a particular order
-    SEL = PRE_SEL[['Entity_Extraction_Method', 'docket_source', 'judge_enum', 'party_enum',
-           'pacer_id', 'docket_index', 'ucid', 'cid', 'court', 'year',
-           'original_text','New_Entity', 'Prefix_Categories',
-           'Transferred_Flag', 'full_span_start', 'full_span_end',
-           'New_Span_Start', 'New_Span_End','Final_Pointer','SJID']].copy()
+    basepath = paths['SEL_DIR']
+    PRIOR_SELS =  PRE_SEL[PRE_SEL.ucid.isin(dockets_old.ucid)]
+    NEW_SELS = PRE_SEL[~PRE_SEL.ucid.isin(dockets_old.ucid)].copy()
+    
+    CHANGED = PRIOR_SELS[PRIOR_SELS.SJID !='Inconclusive'].ucid.unique()
+    REWRITERS = dockets_old[dockets_old.ucid.isin(CHANGED)]
 
-    # give them more understandable names
-    rename_cols = {
-        'New_Entity': 'Extracted_Entity',
-    'New_Span_Start':'Entity_Span_Start' , 
-    'New_Span_End':'Entity_Span_End' ,
-    'Final_Pointer':'Parent_Entity'}
+    # these rows are previously tagged UCIDs that now have an updated entity that is no longer tagged
+    # as inconclusive. We need to combine the previous positive tags with these new tags to write out
+    # the updated SEL file for the ucid
+    for index, row in tqdm.tqdm(REWRITERS.iterrows(), total=len(REWRITERS)):
+        ucid = row['ucid']
+        court = row['court']
 
-    SEL.rename(columns=rename_cols, inplace=True)
-    Old_docks.rename(columns={"Final_Pointer":"Parent_Entity"}, inplace=True)
+        two_way_path = build_SEL_path(basepath,ucid, court)
 
-    # the new JEL will be written to a file, we want the NID to be represented as a string and not floating point number.0
-    Updated_JEL.loc[~Updated_JEL.NID.isna(), "NID"] = Updated_JEL.NID.apply(lambda x: str(x).split(".")[0])
-    Updated_JEL.to_json(paths['New_JEL'], orient='records', lines=True)
+        oldSEL =  raw_load_old_SEL_data(two_way_path)
 
-    # now create a final dataframe for output that consists of all rows we need to overwrite
-    FIN_OUT = pd.concat([SEL,Old_docks])
-    DATA = {}
-    # this is effectively the file list I need
-    temp = FIN_OUT[['court', 'ucid']].copy()
-    temp.drop_duplicates(inplace=True)
+        updated = PRIOR_SELS[PRIOR_SELS.ucid==ucid]
 
-    # for each court, find the year digits
-    # i.e. ilnd;;3:16-cr-00001, the digits are 16
-    # the DATA dict will have 
-    #   {court: {year:{ucid: [sel_row, sel_row],ucid:[sel_row...]}}}
-    for court, ucid in temp.to_numpy():
-        year = ucid.split(";;")[1].split(":")[1][0:2]
-        if court not in DATA:
-            DATA[court] = {year:{ucid:[]}}
-        else:
-            if year not in DATA[court]:
-                DATA[court][year] = {ucid:[]}
-            else:
-                if ucid not in DATA[court][year]:
-                    DATA[court][year][ucid] = []
+        new_data = compile_new_SEL_from_old(oldSEL, updated)
 
-    # grab the path of the directory we are writing sel files to
-    basepath = paths["SEL_DIR"]
+        out_path = build_SEL_path(basepath, ucid, court, update=True)
+        write_to_jsonl_ucid_file((out_path, new_data))
 
-    # for every iteration of court-years, make the directory for it if it doesn exist
-    for court, years in DATA.items():
-        if not os.path.isdir(f"{basepath}/{court}/"):
-            os.mkdir(f"{basepath}/{court}/")
-        for year in years.keys():
-            if not os.path.isdir(f"{basepath}/{court}/{year}/"):
-                os.mkdir(f"{basepath}/{court}/{year}/")
-
-    # now allocate each SEL row into its respective court-year-ucid 
-    for each in tqdm.tqdm(FIN_OUT.to_numpy(), total=len(FIN_OUT)):
-        ucid_index = list(FIN_OUT.columns).index('ucid')
-        court_index = list(FIN_OUT.columns).index('court')
-        year_index = list(FIN_OUT.columns).index('year')
-
-        ucid = each[ucid_index]
-        court = each[court_index]
-        year = ucid.split(";;")[1].split(":")[1][0:2]
-
-        DATA[court][year][ucid].append({cn:e for cn,e in zip(list(FIN_OUT.columns),each)})
-
-    # now we will unwind the DATA dict and write out the ucid-lists into their respective files
-    # unwound will be a giant list of (fpath, [json-data-rows])
-    unwound = []
-    for court, stuff in DATA.items():
-        for year, more_stuff in stuff.items():
-            for ucid, data in more_stuff.items():
-                outfile = f"{paths['SEL_DIR']}/{court}/{year}/{ucid}.jsonl"
-                outfile = outfile.replace(";;","-").replace(":","-")
-                outdata = data
-                unwound.append((outfile, outdata))
-
-    print("NOW WRITING TO FILE")
-    # call the multiprocess file writer
-    multiprocess_file_writer(unwound)
+    # send the data into the writer functions    
+    TO_JSONL(NEW_SELS, newJEL, paths)
 
     return
+
+
+
+def build_SEL_path(basepath: str, ucid: str, court: str, update=False):
+    """Given the meta-information, create a SEL filepath for the ucid
+
+    Args:
+        basepath (str): where the SEL files will be written
+        ucid (str): docket identifier
+        court (str): what court the ucid is in
+        update (bool, optional): If this is an updated file, in which case it gets nested into an _updates folder. Defaults to False.
+
+    Returns:
+        pathlib.Path: resolved path for where this ucid should be written to
+    """
+    year = ucid.split(";;")[1].split(":")[1][0:2]
+    fucid = ucid.replace(";;","-").replace(":","-")
+    if update:
+        updates = Path(f"{basepath}/{court}/{year}/_updates").resolve()
+        if not updates.is_dir():
+            updates.mkdir()
+        return Path(f"{basepath}/{court}/{year}/_updates/{fucid}_U.jsonl").resolve()
+    else:
+        return Path(f"{basepath}/{court}/{year}/{fucid}.jsonl").resolve()
+
+
+def raw_load_old_SEL_data(path: Path):
+    """loader for old SEL files, no inference just line reading
+
+    Args:
+        path (Path): filepath
+
+    Returns:
+        list: list of valid jsons
+    """
+    
+    if not path.exists():
+        return []
+    
+    row_data = []
+    with open(path) as f:
+        for line in f:
+            jdat = json.loads(line)
+            row_data.append(jdat)
+    return row_data
+
+def load_old_SEL_data(path: Path):
+    """loader for old SEL files; infer if the row belongs in inconclusive data or in pre-identified data
+
+    Args:
+        path (Path): filepath
+
+    Returns:
+        list, list: prior ucid row tags split into conclusive and inconclusively tagged data
+    """
+    
+    if not path.exists():
+        return [],[]
+    
+    inconclusive_data = []
+    SJID_data = []
+    with open(path) as f:
+        for line in f:
+            jdat = json.loads(line)
+            if jdat['SJID'] in ['Inconclusive','Ambiguous']:
+                inconclusive_data.append(jdat)
+            else:
+                SJID_data.append({
+                    'ucid': jdat['ucid'],
+                    'court': jdat['court'],
+                    'docket_source': jdat['docket_source'],
+                    'Prefix_Categories': jdat['Prefix_Categories'],
+                    'SJID': jdat['SJID']
+                })
+    return SJID_data, inconclusive_data
+
+def compile_new_SEL_from_old(oldSEL: list, updated: pd.DataFrame):
+    """Given a prior SEL and new tags, fuze the old conclusive tags with the newly updated information
+    generated for the previously inconclusive tags
+
+    Args:
+        oldSEL (list): list of valid jsons from the old sel file
+        updated (pd.DataFrame): updated information tags on a subset of the rows from the SEL
+
+    Returns:
+        list: final list of jsons to be written to an updated SEL file
+    """
+    
+    # create a unique ID for each row to figure out which old ones to keep and new ones to swap in
+    rows = {}
+    for each in oldSEL:
+        key = f"{each['judge_enum']}-{each['party_enum']}-{each['docket_index']}-{each['full_span_start']}"
+        rows[key] = each
+
+    updates = {}
+    for i, row in updated.iterrows():
+        key = f"{row['judge_enum']}-{row['party_enum']}-{row['docket_index']}-{row['full_span_start']}"
+        data = {
+            'Entity_Extraction_Method': row['Entity_Extraction_Method'],
+             'docket_source': row['docket_source'],
+             'judge_enum': row['judge_enum'],
+             'party_enum': row['party_enum'],
+             'pacer_id': row['pacer_id'],
+             'docket_index': row['docket_index'],
+             'ucid': row['ucid'],
+             'cid': row['cid'],
+             'court': row['court'],
+             'year': row['year'],
+             'entry_or_filing_date': row['entry_or_filing_date'],
+             'original_text': row['original_text'],
+             'Extracted_Entity': row['New_Entity'],
+             'Prefix_Categories': row['Prefix_Categories'],
+             'Transferred_Flag': row['Transferred_Flag'],
+             'full_span_start': row['full_span_start'],
+             'full_span_end': row['full_span_end'],
+             'Entity_Span_Start': row['New_Span_Start'],
+             'Entity_Span_End': row['New_Span_End'],
+             'Parent_Entity': row['Points_To'],
+             'SJID': row['SJID'],
+             'Ambiguous_SJIDS': row['Ambiguous_SJIDS']
+        }
+        updates[key] = data
+
+    Final = []
+    for key, row in rows.items():
+        if key in updates:
+            Final.append(updates[key])
+        else:
+            Final.append(row)
+    
+    return Final
+
+def unpack_DAT(DAT: list):
+    """Given a list of tuples from the SEL loader that splits into conclusive/inconclusive,
+    unpack the list of tuples into 2 distinct lists
+
+    Args:
+        DAT (list): pre-loaded SEL data
+
+    Returns:
+        list, list: split data into conclusive/inconclusive
+    """
+    SJ = []
+    ID = []
+    for SJID_data, inconc_data in DAT:
+        SJ += SJID_data
+        ID += inconc_data
+    return SJ, ID
+
+def _shell_call(inps: tuple):
+    """this function is called by the multiprocessor, it builds a datapath, then loads the data given
+    the ucid and parameters
+
+    Args:
+        inps (tup): tuple containing the sel directory basepath, the ucid, and the court of a docket
+
+    Returns:
+        list, list: the loaded SEL data split into known tags and inconclusive tags
+    """
+    basepath, ucid, court = inps
+    return load_old_SEL_data( build_SEL_path(basepath, ucid, court) )
+
+def multi_process_SEL_loader(dockets_old: pd.DataFrame, paths: dict):
+    """Function loads SEL data for the previously tagged dockets before this disambiguation
+
+    Args:
+        dockets_old (pd.DataFrame): subset of the unique files table
+        paths (dict): dictionary of paths containing keys for the SEL directory
+
+    Returns:
+        list, list: lists of conclusive or inconclusive prior SEL data
+    """
+
+    inps = dockets_old[['ucid','court']].to_numpy()
+    inps = [(paths['SEL_DIR'], *tup) for tup in inps]
+    
+    pool = mp.Pool(mp.cpu_count()-1)
+    
+    # map the writing function across the pool
+    DATA = list(tqdm.tqdm(pool.imap_unordered(_shell_call, inps), total=len(inps),  desc="[--SEL Loading--]", leave=False))
+    
+    # close and join the pool
+    pool.close()
+    pool.join()
+
+
+    old_SJID_Data, old_Inconclusive_Data = unpack_DAT(DATA)
+
+    return old_SJID_Data, old_Inconclusive_Data
+

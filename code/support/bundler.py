@@ -171,7 +171,7 @@ def make_annotated_docket(html_text, json_data, case_annotations):
     Inputs:
         - html_text (str)
         - json_data (dict)
-        - case_annotations (dict): mapping from row index (within case) -> annotation data dict e.g. {'2': [ {span1},...], '5': [ {span2}, ...]}
+        - case_annotations (dict): mapping from row index (int, ordinal index) -> annotation data list of dicts e.g. {2: [ {span1},...], 5: [ {span2}, ...]}
 
     Output:
         (str) html source text for annotated html
@@ -185,7 +185,7 @@ def make_annotated_docket(html_text, json_data, case_annotations):
     for row_index, tr in enumerate(docket_table.select('tr')[1:]):
 
         # Skip row if no annotation
-        if str(row_index) not in case_annotations.keys():
+        if row_index not in case_annotations.keys():
             continue
 
         tr.attrs['class'] = tr.attrs.get('class', '') + ' annotated'
@@ -195,7 +195,7 @@ def make_annotated_docket(html_text, json_data, case_annotations):
 
         # Gather info for new td
         jdata_text = json_data['docket'][row_index]['docket_text']
-        row_annotations = case_annotations[str(row_index)]
+        row_annotations = case_annotations[row_index]
 
         # Build and inject new td
         new_cell = build_new_td(jdata_text, row_annotations, soup)
