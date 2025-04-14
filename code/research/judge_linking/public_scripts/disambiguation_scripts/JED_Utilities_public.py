@@ -491,6 +491,8 @@ def write_SEL(SEL: pd.DataFrame, paths: dict):
     """
 
     basepath = paths["SEL_DIR"]
+    if not os.path.isdir(basepath):
+        os.mkdir(basepath)
     # else:
     DATA = {}
     # this is effectively the file list I need

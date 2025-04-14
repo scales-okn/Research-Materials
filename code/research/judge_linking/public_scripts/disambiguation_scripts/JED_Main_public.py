@@ -2,8 +2,10 @@ import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parents[4]))
 import support.data_tools as dtools
+import support.settings as settings
 
-#nonstandard imports
+# nonstandard imports
+sys.path.append(str(Path(__file__).resolve().parents[0]))
 import JED_Utilities_public as JU
 import JED_Cleaning_Functions_public as JCF
 import JED_Pipelines_public as JP
@@ -11,44 +13,36 @@ import JED_Algorithms_public as JA
 
 
 
-if __name__=="__main__":
+def run_jed(use_config_file=True, indir=None, outdir=None):
 
-    cfg = JU.ingest_config('config.cfg')
+    if use_config_file:
+        cfg = JU.ingest_config('config.cfg')
+    else:
+        indir = Path(indir).resolve()
+        outdir = Path(outdir).resolve()
        
     ############################
     ### >> DATA INGESTION << ###
     ############################
     
-    raw_df, heads_df = JCF.ingest_raw_entities(cfg['DATA_FILES'])
-
-    # raw_df = raw_df[raw_df.year==2016].copy()
-    # heads_df =  heads_df[heads_df.year==2016].copy()
-
-    # fjc_active = JCF.ingest_the_fjc(settings.JUDGEFILE)
-    ba_mag = JCF.ingest_ba_mag(
-        cfg['BA_MAG']['judges'], 
-        cfg['BA_MAG']['positions']
-        )
-
-    fjc_active = JCF.ingest_the_fjc(
-        cfg['FJC']['fjc_file'])    
-
-    # bring in docket data for year and filing date informtion
-    # dockets table for year/filing dates
-    dockets = dtools.load_unique_files_df()
+    raw_df, heads_df = JCF.ingest_raw_entities(cfg['DATA_FILES'] if use_config_file else indir)
+    ba_mag = JCF.ingest_ba_mag(settings.BAMAG_JUDGES, settings.BAMAG_POSITIONS)
+    fjc_active = JCF.ingest_the_fjc(settings.JUDGEFILE)    
         
     # parties and counsels
-    parties = JCF.ingest_header_entities(cfg['DATA_PARTIES'])
-    counsels = JCF.ingest_header_entities(cfg['DATA_COUNSELS'])
+    parties = JCF.ingest_header_entities(cfg['DATA_PARTIES'] if use_config_file else indir/'parties.csv')
+    counsels = JCF.ingest_header_entities(cfg['DATA_COUNSELS'] if use_config_file else indir/'counsels.csv')
 
     ###########################
     ### >> DATA CLEANING << ###
     ###########################
+
     FDF = JP.PIPELINE_Disambiguation_Prep(raw_df, heads_df)
 
     ############################
     ### >> DISAMBIGUATION << ###
     ############################
+
     # within UCID disambiguation
     Post_UCID = JP.UCID_MATCH_PIPELINE(FDF, parties, counsels)
     # within court disambiguation
@@ -62,5 +56,11 @@ if __name__=="__main__":
     ###########################
     ### >> WRITING FUNC. << ###
     ###########################
-    paths = cfg['OUT_PATHS']
+
+    paths = cfg['OUT_PATHS'] if use_config_file else {'JEL':outdir/'JEL.jsonl', 'SEL':outdir/'SEL.jsonl', 'SEL_DIR':outdir/'SEL_DIR'}
     JEL, SEL = JU.TO_JSONL(PRE_SEL, JEL, paths)
+
+
+
+if __name__=="__main__":
+    run_jed()

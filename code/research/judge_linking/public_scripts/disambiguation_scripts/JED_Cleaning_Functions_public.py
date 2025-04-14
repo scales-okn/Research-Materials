@@ -23,19 +23,18 @@ def ingest_raw_entities(dir_path):
     """
 
     # specific data files we want to load (in case the directory gets jumbled or log files appear)
-    # ner_extraction_paths = [path for path in os.listdir(dir_path) if '.csv' in path]
-    ner_extraction_paths = Path(dir_path).glob('**/*')
-    ner_extraction_paths = [p for p in ner_extraction_paths if p.suffix=='.csv']
+    ner_extraction_paths = Path(dir_path).glob('*.csv')
+    # ner_extraction_paths = Path(dir_path).glob('**/*')
+    # ner_extraction_paths = [p for p in ner_extraction_paths if p.suffix=='.csv']
 
     # read and concat files into pd DF
     raw_data = []
     heads_df= []
     for nerpath in ner_extraction_paths:
-        file_end = nerpath.stem.split("_")[-1]
         temp = pd.read_csv(nerpath)
-        if file_end == 'headers':
+        if 'headers' in str(nerpath):
             heads_df.append(temp)
-        else:
+        elif 'entries' in str(nerpath):
             raw_data.append(temp)
 
     raw_df = pd.concat(raw_data)
@@ -45,7 +44,7 @@ def ingest_raw_entities(dir_path):
     raw_df.drop_duplicates(inplace=True)
     heads_df.drop_duplicates(inplace=True)
 
-    JU.log_message(f"-{len(ner_extraction_paths)} total files ingested")
+    JU.log_message(f"-{len(list(ner_extraction_paths))} total files ingested")
     JU.log_message(f"-{len(raw_df.court.unique())} total courts represented")
 
 
