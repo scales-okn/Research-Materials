@@ -265,7 +265,7 @@ def load_data(fpath, pbar):
     with open(fpath) as f:
         case = json.load(f)
 
-    year = int(case['filing_date'].split('/')[-1])
+    year = int(case['filing_date'].split('/')[-1]) if case['filing_date'] else None
     if 'court' not in case:
         court = ucid.split(";;")[0]
     else:
