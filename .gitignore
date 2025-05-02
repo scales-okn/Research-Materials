@@ -127,3 +127,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# other
+code/research/judge_linking/public_scripts/model/
