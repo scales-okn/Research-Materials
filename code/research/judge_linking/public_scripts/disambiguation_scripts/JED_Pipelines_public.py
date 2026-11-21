@@ -790,7 +790,7 @@ def UCID_PIPE_Build_Remapped_Lookup(new_map, toss_map, concatenated_df):
     """
 
     print("Pipe: Building Remapped DataFrame")
-    print(">>Applying remappings")
+    print(">> Applying remappings")
     # loop through the objects by ucid grouping
     remapped = []
     # key is a ucid, objs are the entities on the case
@@ -808,7 +808,7 @@ def UCID_PIPE_Build_Remapped_Lookup(new_map, toss_map, concatenated_df):
                     'is_party':False}
                 )
 
-    print(">>Tossing junk entities")
+    print(">> Tossing junk entities")
     # same concept applies here, except we map the tossed entities into a null category so they are ruled out for all
     # further disambiguation -- these were parties/counsels
     tossed = []
@@ -827,7 +827,7 @@ def UCID_PIPE_Build_Remapped_Lookup(new_map, toss_map, concatenated_df):
 
     # merge the remapped data onto the original dataframe by the original cleaned entity name
     print(">> Merging into Core Data")
-    Post_UCID = concatenated_df.merge(REM, how='left', on = ['ucid','Cleaned_Entity'])
+    Post_UCID = concatenated_df.merge(REM, how='left', on = ['ucid','Cleaned_Entity']) if len(REM) else concatenated_df.assign(Points_To=None, is_party=None)
 
     # if the old frame's "point to" was null, that means it remained an eligible entity, fill its point to with itself
     Post_UCID["Points_To"].fillna(Post_UCID.Cleaned_Entity, inplace=True)
